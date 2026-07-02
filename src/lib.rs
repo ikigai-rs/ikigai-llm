@@ -38,6 +38,31 @@ use serde_json::{json, Value};
 /// localhost, is a network act.
 const CAP_NET: &str = "urn:cap:net";
 
+/// A backend's capability profile — the traits selection reasons over. All
+/// **declared** (config-authored) for now; provider auto-discovery (e.g. Ollama's
+/// `/api/show`) is a later slice that fills gaps, declared-wins.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Caps {
+    /// Context window, in tokens.
+    #[serde(default)]
+    pub context: Option<u64>,
+    /// Input modalities, e.g. `["text"]` or `["text", "vision"]`.
+    #[serde(default)]
+    pub modalities: Vec<String>,
+    /// Supports tool / function calling.
+    #[serde(default)]
+    pub tools: Option<bool>,
+    /// Supports a structured-output (JSON) mode.
+    #[serde(default)]
+    pub json: Option<bool>,
+    /// Cost tier: `local` | `cheap` | `premium`.
+    #[serde(default)]
+    pub cost: Option<String>,
+    /// Display-only parameter count, e.g. `"3B"`, `"70B"`.
+    #[serde(default)]
+    pub params: Option<String>,
+}
+
 /// Configuration for an OpenAI-compatible chat backend. One shape covers Ollama,
 /// vLLM, `llama.cpp`'s server, `mlx_lm.server`, and LM Studio.
 #[derive(Clone, Debug)]
@@ -52,6 +77,9 @@ pub struct OpenAiConfig {
     pub default_model: String,
     /// Bearer token, if the endpoint needs one. Local runtimes usually don't.
     pub api_key: Option<String>,
+    /// The declared capability profile (what `urn:llm:models` reports and
+    /// selection will reason over). Empty by default.
+    pub caps: Caps,
 }
 
 impl OpenAiConfig {
@@ -62,6 +90,10 @@ impl OpenAiConfig {
             base_url: "http://localhost:11434/v1".to_string(),
             default_model: default_model.into(),
             api_key: None,
+            caps: Caps {
+                cost: Some("local".to_string()),
+                ..Caps::default()
+            },
         }
     }
 }
@@ -103,6 +135,8 @@ impl Registry {
             model: String,
             #[serde(default)]
             api_key: Option<String>,
+            #[serde(default)]
+            caps: Caps,
         }
         #[derive(Deserialize)]
         struct Doc {
@@ -119,6 +153,7 @@ impl Registry {
                 base_url: e.base_url,
                 default_model: e.model,
                 api_key: e.api_key,
+                caps: e.caps,
             })
             .collect();
         Ok(Registry {
@@ -155,13 +190,21 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
         .bind(
             Exact::new("urn:llm:config"),
             ConfigEndpoint::new(registry.clone()),
+        )
+        .bind(
+            Exact::new("urn:llm:models"),
+            ModelsEndpoint::new(registry.clone()),
         );
     for provider in &registry.providers {
-        let iri = format!("urn:llm:{}:ask", provider.provider);
-        space = space.bind(
-            Exact::new(iri),
-            OpenAiBackend::new(provider.clone(), Arc::clone(&transport)),
-        );
+        space = space
+            .bind(
+                Exact::new(format!("urn:llm:{}:ask", provider.provider)),
+                OpenAiBackend::new(provider.clone(), Arc::clone(&transport)),
+            )
+            .bind(
+                Exact::new(format!("urn:llm:{}:up", provider.provider)),
+                UpEndpoint::new(provider.clone(), Arc::clone(&transport)),
+            );
     }
     space
 }
@@ -237,20 +280,12 @@ impl Endpoint for OpenAiBackend {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // Reaching a server — even localhost — is a network act, gated per-host by
         // the same capability convention ikigai-http uses (urn:cap:net:<host>).
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        let parsed = url::Url::parse(&url).map_err(|e| {
-            Error::Endpoint(format!("llm: bad base_url `{}`: {e}", self.config.base_url))
-        })?;
-        let host = parsed.host_str().unwrap_or("");
-        if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
-            return Err(Error::Endpoint(format!(
-                "urn:llm:{}:ask: capability does not allow reaching `{host}` (needs urn:cap:net:{host})",
-                self.config.provider
-            )));
-        }
+        let url = require_net(
+            inv,
+            &self.config.base_url,
+            "chat/completions",
+            &format!("urn:llm:{}:ask", self.config.provider),
+        )?;
 
         // Prompt: explicit `prompt=`, else the piped `content`.
         let prompt = inv
@@ -445,6 +480,220 @@ impl Endpoint for ConfigEndpoint {
     }
 }
 
+// ---- the model inventory ------------------------------------------------------
+
+/// `urn:llm:models` — the annotated inventory: every configured backend with its
+/// model and declared [`Caps`], as JSON (default) or Turtle (`as=text/turtle`).
+/// The Turtle face is the queryable trait graph — SPARQL over it is how
+/// capability-based selection ("a vision model with ≥32k context") will resolve.
+/// Config-derived, so cacheable until the registry changes (a restart, for now).
+pub struct ModelsEndpoint {
+    registry: Registry,
+}
+
+impl ModelsEndpoint {
+    fn new(registry: Registry) -> Self {
+        ModelsEndpoint { registry }
+    }
+
+    fn as_json(&self) -> Value {
+        let mut models = serde_json::Map::new();
+        for p in &self.registry.providers {
+            let caps = &p.caps;
+            models.insert(
+                p.provider.clone(),
+                json!({
+                    "backend": format!("urn:llm:{}:ask", p.provider),
+                    "model": p.default_model,
+                    "base_url": p.base_url,
+                    "caps": {
+                        "context": caps.context,
+                        "modalities": caps.modalities,
+                        "tools": caps.tools,
+                        "json": caps.json,
+                        "cost": caps.cost,
+                        "params": caps.params,
+                    },
+                }),
+            );
+        }
+        json!({ "default": self.registry.default, "models": models })
+    }
+
+    /// The trait graph. Vocabulary is module-local for now (`ik:LlmBackend`,
+    /// `ik:model`, `ik:context`, `ik:modality`, `ik:tools`, `ik:jsonMode`,
+    /// `ik:cost`, `ik:params`) — promotion into ikigai-vocab is a follow-up.
+    fn as_turtle(&self) -> String {
+        let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
+        for p in &self.registry.providers {
+            let mut props = vec![
+                "a ik:LlmBackend".to_string(),
+                format!("ik:model {}", ttl_str(&p.default_model)),
+            ];
+            if let Some(c) = p.caps.context {
+                props.push(format!("ik:context {c}"));
+            }
+            for m in &p.caps.modalities {
+                props.push(format!("ik:modality {}", ttl_str(m)));
+            }
+            if let Some(t) = p.caps.tools {
+                props.push(format!("ik:tools {t}"));
+            }
+            if let Some(j) = p.caps.json {
+                props.push(format!("ik:jsonMode {j}"));
+            }
+            if let Some(c) = &p.caps.cost {
+                props.push(format!("ik:cost {}", ttl_str(c)));
+            }
+            if let Some(pr) = &p.caps.params {
+                props.push(format!("ik:params {}", ttl_str(pr)));
+            }
+            ttl.push_str(&format!(
+                "\n<urn:llm:{}:ask> {} .\n",
+                p.provider,
+                props.join(" ;\n    ")
+            ));
+        }
+        ttl.push_str(&format!(
+            "\n<urn:llm:ask> ik:routesTo <urn:llm:{}:ask> .\n",
+            self.registry.default
+        ));
+        ttl
+    }
+}
+
+/// A Turtle string literal (quote-and-escape).
+fn ttl_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[async_trait]
+impl Endpoint for ModelsEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let want_turtle = inv
+            .inline_str("as")
+            .map(|s| s.contains("turtle"))
+            .unwrap_or(false);
+        let (media, bytes) = if want_turtle {
+            ("text/turtle", self.as_turtle().into_bytes())
+        } else {
+            (
+                "application/json",
+                serde_json::to_vec(&self.as_json()).unwrap_or_default(),
+            )
+        };
+        Ok(
+            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes)
+                .cacheable(),
+        )
+    }
+
+    fn name(&self) -> &str {
+        "llm-models"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:llm:models")
+            .summary(
+                "The annotated model inventory: every configured backend with its model \
+                 and declared capability profile (context, modalities, tools, cost). \
+                 JSON by default; `as=text/turtle` renders the queryable trait graph.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("as")
+                    .summary("output representation: application/json (default) or text/turtle")
+                    .optional(),
+            )
+            .output("application/json")
+    }
+}
+
+// ---- liveness -----------------------------------------------------------------
+
+/// `urn:llm:<provider>:up` — a boolean liveness resource: `true` if the provider
+/// answers a cheap `GET {base_url}/models`, else `false`. Made for
+/// `urn:fn:conditional` (`if=urn:llm:ollama:up then=<demo> else=<offline note>`),
+/// so LLM demos degrade gracefully instead of erroring when the server is down.
+/// Deliberately **uncacheable** — liveness is a live fact. A capability that
+/// cannot reach the host is an error, not `false` (denied ≠ down).
+pub struct UpEndpoint {
+    config: OpenAiConfig,
+    transport: Arc<dyn HttpTransport>,
+}
+
+impl UpEndpoint {
+    fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
+        UpEndpoint { config, transport }
+    }
+}
+
+#[async_trait]
+impl Endpoint for UpEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let url = require_net(
+            inv,
+            &self.config.base_url,
+            "models",
+            &format!("urn:llm:{}:up", self.config.provider),
+        )?;
+        let alive = match self
+            .transport
+            .send(HttpRequest {
+                method: Method::Get,
+                url,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+        {
+            Ok(response) => response.status < 400,
+            Err(_) => false, // unreachable server = down, not an error
+        };
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            if alive {
+                b"true".to_vec()
+            } else {
+                b"false".to_vec()
+            },
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "llm-up"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(format!("urn:llm:{}:up", self.config.provider))
+            .summary(
+                "Boolean liveness: `true` if the provider answers a cheap GET, else \
+                 `false`. Branch on it with urn:fn:conditional to degrade gracefully.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+            .requires(CAP_NET)
+    }
+}
+
+/// Gate an outbound call by the per-host net capability and return the full URL:
+/// `{base_url}/{path}` checked via [`ikigai_http::net_allows`]. Shared by every
+/// endpoint here that touches the provider.
+fn require_net(inv: &Invocation<'_>, base_url: &str, path: &str, who: &str) -> Result<String> {
+    let url = format!("{}/{path}", base_url.trim_end_matches('/'));
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| Error::Endpoint(format!("{who}: bad base_url `{base_url}`: {e}")))?;
+    let host = parsed.host_str().unwrap_or("");
+    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+        return Err(Error::Endpoint(format!(
+            "{who}: capability does not allow reaching `{host}` (needs urn:cap:net:{host})"
+        )));
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,7 +822,9 @@ mod tests {
     const TWO_PROVIDERS: &str = r#"{
         "default": "fast",
         "providers": {
-            "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
+            "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+                        "caps": { "context": 131072, "modalities": ["text"], "tools": true,
+                                  "cost": "local", "params": "3B" } },
             "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "sk-SECRET" }
         }
     }"#;
@@ -609,6 +860,95 @@ mod tests {
         ] {
             assert!(patterns.iter().any(|p| p == expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn from_json_parses_caps() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let fast = reg.providers.iter().find(|p| p.provider == "fast").unwrap();
+        assert_eq!(fast.caps.context, Some(131072));
+        assert_eq!(fast.caps.tools, Some(true));
+        assert_eq!(fast.caps.cost.as_deref(), Some("local"));
+        // caps are optional — `remote` declared none.
+        let remote = reg
+            .providers
+            .iter()
+            .find(|p| p.provider == "remote")
+            .unwrap();
+        assert_eq!(remote.caps.context, None);
+    }
+
+    fn issue(kernel: &Kernel, req: Request) -> Representation {
+        block_on(kernel.issue(req, &Capability::root())).unwrap()
+    }
+
+    #[test]
+    fn models_reports_the_annotated_inventory() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(CANNED), reg)));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["default"], "fast");
+        assert_eq!(v["models"]["fast"]["backend"], "urn:llm:fast:ask");
+        assert_eq!(v["models"]["fast"]["caps"]["context"], 131072);
+        assert_eq!(v["models"]["remote"]["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn models_renders_the_trait_graph_as_turtle() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(CANNED), reg)));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap())
+                .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec())),
+        );
+        let ttl = String::from_utf8(out.bytes).unwrap();
+        assert!(ttl.contains("<urn:llm:fast:ask> a ik:LlmBackend"));
+        assert!(ttl.contains("ik:context 131072"));
+        assert!(ttl.contains("ik:tools true"));
+        assert!(ttl.contains("<urn:llm:ask> ik:routesTo <urn:llm:fast:ask>"));
+    }
+
+    /// A transport whose server is unreachable — every send fails.
+    struct DownTransport;
+
+    #[async_trait]
+    impl HttpTransport for DownTransport {
+        async fn send(&self, _r: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            Err("connection refused".to_string())
+        }
+    }
+
+    #[test]
+    fn up_is_true_when_the_provider_answers() {
+        let mock = MockTransport::new("{}");
+        let kernel = kernel_with(Arc::clone(&mock));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:ollama:up").unwrap()),
+        );
+        assert_eq!(out.bytes, b"true");
+        // and the ping was the cheap models listing, not a completion
+        let pinged = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(pinged.url, "http://localhost:11434/v1/models");
+        assert_eq!(pinged.method, Method::Get);
+    }
+
+    #[test]
+    fn up_is_false_when_the_provider_is_unreachable() {
+        let kernel = Kernel::new(Arc::new(space(
+            Arc::new(DownTransport),
+            OpenAiConfig::ollama("llama3.1"),
+        )));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:ollama:up").unwrap()),
+        );
+        assert_eq!(out.bytes, b"false");
     }
 
     #[test]

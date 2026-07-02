@@ -48,7 +48,9 @@ load-time form of "the logical config aliases to file-or-code"):
 {
   "default": "fast",
   "providers": {
-    "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
+    "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+                "caps": { "context": 131072, "modalities": ["text"], "tools": true,
+                          "cost": "local", "params": "3B" } },
     "big":    { "base_url": "http://localhost:11434/v1", "model": "llama3.1:70b" },
     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
   }
@@ -63,12 +65,34 @@ let space = ikigai_llm::space(Arc::new(my_transport), registry);
 
 `source urn:llm:config` shows the loaded registry with keys masked as `***`.
 
+## Capability profiles & `urn:llm:models`
+Each provider may declare a **`caps`** profile — `context` (tokens), `modalities`
+(`["text","vision"]`), `tools`, `json`, `cost` (`local`|`cheap`|`premium`),
+`params` (`"3B"`) — the traits selection will reason over. **`urn:llm:models`**
+is the annotated inventory: JSON by default, and `as=text/turtle` renders the
+**queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
+`ik:modality` · `ik:tools` · `ik:cost`), so "a vision model with ≥32k context"
+becomes a SPARQL query over a resource. Caps are declared (config-authored);
+provider auto-discovery fills gaps in a later slice, declared-wins.
+
+## Liveness: `urn:llm:<provider>:up`
+A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
+else `false`. Built for `urn:fn:conditional`, so demos degrade gracefully:
+
+```text
+source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:ollama-offline
+```
+
+Uncacheable (liveness is a live fact); a capability that can't reach the host is
+an error, not `false` (denied ≠ down).
+
 ## Design & roadmap
 The facade is the imperative seed of the interception/rewrite primitive: a static
 alias would be a `Rewrite` space, but selection that reads args/config is an
-endpoint whose `invoke` does the rewrite. Deferred: **live-reload** (make
-`urn:llm:config` a live resource that sources the file under a golden thread),
-**transrepted config** (author YAML/Turtle, transrept through the kernel),
-`key_ref` → the secrets infra, native Ollama backend + `urn:llm:models`,
-deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX
-(pyo3), streaming, and `urn:llm:embed`.
+endpoint whose `invoke` does the rewrite. Deferred: **capability-based selection**
+(`needs="vision, ctx>=32k"` resolved over the trait graph), **Ollama auto-discovery**
+(`/api/show` fills caps, declared-wins), **live-reload** (make `urn:llm:config` a
+live resource that sources the file under a golden thread), **transrepted config**
+(author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,
+deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX (pyo3),
+streaming, and `urn:llm:embed`.
