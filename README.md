@@ -75,6 +75,27 @@ is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 becomes a SPARQL query over a resource. Caps are declared (config-authored);
 provider auto-discovery fills gaps in a later slice, declared-wins.
 
+## Capability-based selection: `urn:llm:select` & `needs=`
+Stop naming models — state requirements. **`urn:llm:select needs="…"`** resolves a
+requirement expression over the declared trait profiles and returns the winning
+backend IRI; the **facade accepts the same `needs=`** and routes the ask directly:
+
+```text
+source urn:llm:select needs="vision, ctx>=32k, cost<=cheap"     -> urn:llm:seer:ask
+source urn:llm:ask needs="ctx>=100k" prompt="…"                 -> asks the winner
+```
+
+Grammar (comma-separated): `ctx>=N` (or `Nk` = ×1024) · `cost<=tier` / `cost=tier`
+(`local` < `cheap` < `premium`) · `modality=x` or bare `text`/`vision`/`audio` ·
+`tools` · `json`. Unknown terms **error** (a typo must not mis-select); a trait a
+provider didn't declare can't satisfy a requirement on it. Policy among matches:
+**cheapest-that-fits → smallest context → registry order**. Routing precedence on
+the facade: `provider=` → `needs=` → the configured default.
+
+Selection is deterministic plain code over the registry — the SPARQL power path
+is *composition*, not a dependency: `urn:llm:models as=text/turtle` is the same
+trait data as a queryable graph.
+
 ## Liveness: `urn:llm:<provider>:up`
 A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
 else `false`. Built for `urn:fn:conditional`, so demos degrade gracefully:
@@ -89,8 +110,7 @@ an error, not `false` (denied ≠ down).
 ## Design & roadmap
 The facade is the imperative seed of the interception/rewrite primitive: a static
 alias would be a `Rewrite` space, but selection that reads args/config is an
-endpoint whose `invoke` does the rewrite. Deferred: **capability-based selection**
-(`needs="vision, ctx>=32k"` resolved over the trait graph), **Ollama auto-discovery**
+endpoint whose `invoke` does the rewrite. Deferred: **Ollama auto-discovery**
 (`/api/show` fills caps, declared-wins), **live-reload** (make `urn:llm:config` a
 live resource that sources the file under a golden thread), **transrepted config**
 (author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,

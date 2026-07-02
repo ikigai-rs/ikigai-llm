@@ -186,7 +186,7 @@ impl From<OpenAiConfig> for Registry {
 pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -> EndpointSpace {
     let registry = registry.into();
     let mut space = EndpointSpace::new()
-        .bind(Exact::new("urn:llm:ask"), AskFacade::new(&registry.default))
+        .bind(Exact::new("urn:llm:ask"), AskFacade::new(registry.clone()))
         .bind(
             Exact::new("urn:llm:config"),
             ConfigEndpoint::new(registry.clone()),
@@ -194,6 +194,10 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
         .bind(
             Exact::new("urn:llm:models"),
             ModelsEndpoint::new(registry.clone()),
+        )
+        .bind(
+            Exact::new("urn:llm:select"),
+            SelectEndpoint::new(registry.clone()),
         );
     for provider in &registry.providers {
         space = space
@@ -211,28 +215,36 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
 
 // ---- the facade -------------------------------------------------------------
 
-/// `urn:llm:ask` — the front grammar. Picks a backend (`provider=` arg, else the
-/// configured default) and re-issues the request to `urn:llm:<provider>:ask`.
+/// `urn:llm:ask` — the front grammar. Picks a backend (`provider=` arg, else
+/// `needs=` resolved over the trait profiles, else the configured default) and
+/// re-issues the request to `urn:llm:<provider>:ask`.
 pub struct AskFacade {
-    default_provider: String,
+    registry: Registry,
 }
 
 impl AskFacade {
-    /// A facade defaulting to `default_provider` when a request names none.
-    pub fn new(default_provider: impl Into<String>) -> Self {
-        AskFacade {
-            default_provider: default_provider.into(),
-        }
+    /// A facade over `registry`: routes by `provider=`, else resolves `needs=`
+    /// against the trait profiles, else falls back to the registry's default.
+    pub fn new(registry: Registry) -> Self {
+        AskFacade { registry }
     }
 }
 
 #[async_trait]
 impl Endpoint for AskFacade {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let provider = inv
-            .inline_str("provider")
-            .map(str::to_string)
-            .unwrap_or_else(|_| self.default_provider.clone());
+        // Explicit `provider=` wins; then `needs=` (capability-based selection);
+        // then the configured default.
+        let provider = if let Ok(name) = inv.inline_str("provider") {
+            name.to_string()
+        } else if let Ok(needs) = inv.inline_str("needs") {
+            select(&self.registry, &parse_needs(needs)?)
+                .ok_or_else(|| no_match_error("urn:llm:ask", needs, &self.registry))?
+                .provider
+                .clone()
+        } else {
+            self.registry.default.clone()
+        };
         let target = Iri::parse(format!("urn:llm:{provider}:ask"))
             .map_err(|e| Error::Endpoint(format!("urn:llm:ask: bad provider `{provider}`: {e}")))?;
         // Rewrite the target; carry every argument through unchanged. Going via
@@ -250,11 +262,17 @@ impl Endpoint for AskFacade {
     fn describe(&self) -> Description {
         ask_description(
             "urn:llm:ask",
-            "Ask an LLM: route to a backend (provider= or the configured default) and return the completion.",
+            "Ask an LLM: route to a backend (provider=, else needs= resolved over the \
+             trait profiles, else the configured default) and return the completion.",
         )
         .input(
             ArgSpec::new("provider")
                 .summary("backend to route to, e.g. ollama (default: configured)")
+                .optional(),
+        )
+        .input(
+            ArgSpec::new("needs")
+                .summary("capability requirements, e.g. \"vision, ctx>=32k, cost<=cheap\"")
                 .optional(),
         )
     }
@@ -610,6 +628,219 @@ impl Endpoint for ModelsEndpoint {
     }
 }
 
+// ---- capability-based selection -------------------------------------------------
+
+/// One parsed requirement from a `needs=` expression.
+#[derive(Debug, PartialEq)]
+enum Need {
+    /// `ctx>=32k` / `context>=32000` — context window at least this many tokens.
+    ContextAtLeast(u64),
+    /// `cost<=cheap` — cost tier at most this rank (local < cheap < premium).
+    CostAtMost(u8),
+    /// `cost=local` — exactly this cost tier.
+    CostExactly(u8),
+    /// `vision` / `modality=vision` — the modality must be declared.
+    Modality(String),
+    /// `tools` — declared tool/function calling.
+    Tools,
+    /// `json` — declared structured-output mode.
+    Json,
+}
+
+/// The cost-tier ordering selection reasons over.
+fn cost_rank(tier: &str) -> Option<u8> {
+    match tier {
+        "local" => Some(0),
+        "cheap" => Some(1),
+        "premium" => Some(2),
+        _ => None,
+    }
+}
+
+/// A token count, allowing a `k` suffix (`32k` = 32 × 1024).
+fn parse_tokens(v: &str) -> Option<u64> {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix(['k', 'K']) {
+        n.trim().parse::<u64>().ok().map(|n| n * 1024)
+    } else {
+        v.parse::<u64>().ok()
+    }
+}
+
+/// Parse a comma-separated `needs=` expression: `trait`, `trait=v`, `trait>=v`,
+/// `trait<=v`. Unknown terms are an error — a mistyped requirement must not
+/// silently select the wrong model.
+fn parse_needs(expr: &str) -> Result<Vec<Need>> {
+    let bad = |term: &str, why: &str| Error::InvalidArgument {
+        name: "needs".to_string(),
+        detail: format!("`{term}`: {why}"),
+    };
+    let mut needs = Vec::new();
+    for term in expr.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let need = if let Some((k, v)) = term.split_once(">=") {
+            match k.trim() {
+                "ctx" | "context" => Need::ContextAtLeast(
+                    parse_tokens(v).ok_or_else(|| bad(term, "expected a token count"))?,
+                ),
+                other => return Err(bad(term, &format!("`{other}` does not support >="))),
+            }
+        } else if let Some((k, v)) = term.split_once("<=") {
+            match k.trim() {
+                "cost" => Need::CostAtMost(
+                    cost_rank(v.trim()).ok_or_else(|| bad(term, "expected local|cheap|premium"))?,
+                ),
+                other => return Err(bad(term, &format!("`{other}` does not support <="))),
+            }
+        } else if let Some((k, v)) = term.split_once('=') {
+            match k.trim() {
+                "cost" => Need::CostExactly(
+                    cost_rank(v.trim()).ok_or_else(|| bad(term, "expected local|cheap|premium"))?,
+                ),
+                "modality" => Need::Modality(v.trim().to_string()),
+                other => return Err(bad(term, &format!("unknown trait `{other}`"))),
+            }
+        } else {
+            match term {
+                "tools" => Need::Tools,
+                "json" => Need::Json,
+                "text" | "vision" | "audio" => Need::Modality(term.to_string()),
+                other => return Err(bad(term, &format!("unknown requirement `{other}`"))),
+            }
+        };
+        needs.push(need);
+    }
+    Ok(needs)
+}
+
+/// Does a declared profile satisfy every need? Conservative: a trait the
+/// provider didn't declare cannot satisfy a requirement on it.
+fn caps_satisfy(caps: &Caps, needs: &[Need]) -> bool {
+    needs.iter().all(|need| match need {
+        Need::ContextAtLeast(n) => caps.context.is_some_and(|c| c >= *n),
+        Need::CostAtMost(r) => caps
+            .cost
+            .as_deref()
+            .and_then(cost_rank)
+            .is_some_and(|c| c <= *r),
+        Need::CostExactly(r) => caps.cost.as_deref().and_then(cost_rank) == Some(*r),
+        Need::Modality(m) => caps.modalities.iter().any(|x| x == m),
+        Need::Tools => caps.tools == Some(true),
+        Need::Json => caps.json == Some(true),
+    })
+}
+
+/// The satisfying provider under the policy **cheapest-that-fits → smallest
+/// context → registry order** (an undeclared cost tier sorts last).
+fn select<'a>(registry: &'a Registry, needs: &[Need]) -> Option<&'a OpenAiConfig> {
+    registry
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| caps_satisfy(&p.caps, needs))
+        .min_by_key(|(i, p)| {
+            (
+                p.caps.cost.as_deref().and_then(cost_rank).unwrap_or(3),
+                p.caps.context.unwrap_or(u64::MAX),
+                *i,
+            )
+        })
+        .map(|(_, p)| p)
+}
+
+/// A no-match error that says what was asked and what was available.
+fn no_match_error(who: &str, needs: &str, registry: &Registry) -> Error {
+    let available: Vec<&str> = registry
+        .providers
+        .iter()
+        .map(|p| p.provider.as_str())
+        .collect();
+    Error::Endpoint(format!(
+        "{who}: no configured backend satisfies `{needs}` (providers: {}) — see urn:llm:models",
+        available.join(", ")
+    ))
+}
+
+/// `urn:llm:select` — deterministic capability-based selection: resolve a
+/// `needs=` expression over the declared trait profiles and return the winning
+/// backend's IRI (`text/plain`, pipeable) or its detail (`as=application/json`).
+/// Selection is a pure function of the registry, so the result is cacheable.
+/// (The SPARQL power path is composition, not a dep: `urn:llm:models
+/// as=text/turtle` is the same trait data as a queryable graph.)
+pub struct SelectEndpoint {
+    registry: Registry,
+}
+
+impl SelectEndpoint {
+    fn new(registry: Registry) -> Self {
+        SelectEndpoint { registry }
+    }
+}
+
+#[async_trait]
+impl Endpoint for SelectEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let needs = inv.inline_str("needs")?;
+        let winner = select(&self.registry, &parse_needs(needs)?)
+            .ok_or_else(|| no_match_error("urn:llm:select", needs, &self.registry))?;
+        let want_json = inv
+            .inline_str("as")
+            .map(|s| s.contains("json"))
+            .unwrap_or(false);
+        let (media, bytes) = if want_json {
+            let detail = json!({
+                "backend": format!("urn:llm:{}:ask", winner.provider),
+                "provider": winner.provider,
+                "model": winner.default_model,
+                "cost": winner.caps.cost,
+                "context": winner.caps.context,
+            });
+            (
+                "application/json",
+                serde_json::to_vec(&detail).unwrap_or_default(),
+            )
+        } else {
+            (
+                "text/plain",
+                format!("urn:llm:{}:ask", winner.provider).into_bytes(),
+            )
+        };
+        Ok(
+            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes)
+                .cacheable(),
+        )
+    }
+
+    fn name(&self) -> &str {
+        "llm-select"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:llm:select")
+            .summary(
+                "Capability-based selection: resolve `needs` (e.g. \"vision, ctx>=32k, \
+                 cost<=cheap\") over the declared trait profiles and return the winning \
+                 backend IRI. Policy: cheapest-that-fits, then smallest context, then \
+                 registry order.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(ArgSpec::new("needs").summary(
+                "comma-separated requirements: ctx>=N[k] · cost<=tier · cost=tier · \
+                 modality=X (or bare text/vision/audio) · tools · json",
+            ))
+            .input(
+                ArgSpec::new("as")
+                    .summary("text/plain backend IRI (default) or application/json detail")
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8")
+    }
+}
+
 // ---- liveness -----------------------------------------------------------------
 
 /// `urn:llm:<provider>:up` — a boolean liveness resource: `true` if the provider
@@ -911,6 +1142,106 @@ mod tests {
         assert!(ttl.contains("ik:context 131072"));
         assert!(ttl.contains("ik:tools true"));
         assert!(ttl.contains("<urn:llm:ask> ik:routesTo <urn:llm:fast:ask>"));
+    }
+
+    /// Three providers with distinct trait profiles, for selection tests:
+    /// fast = local text 128k · seer = local vision 32k · posh = premium vision+tools 128k.
+    const SELECTABLE: &str = r#"{
+        "default": "fast",
+        "providers": {
+            "fast": { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+                      "caps": { "context": 131072, "modalities": ["text"], "cost": "local" } },
+            "seer": { "base_url": "http://localhost:11434/v1", "model": "llava:7b",
+                      "caps": { "context": 32768, "modalities": ["text", "vision"], "cost": "local" } },
+            "posh": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "sk-S",
+                      "caps": { "context": 131072, "modalities": ["text", "vision"], "tools": true, "cost": "premium" } }
+        }
+    }"#;
+
+    fn select_kernel(mock: Arc<MockTransport>) -> Kernel {
+        let reg = Registry::from_json(SELECTABLE).unwrap();
+        Kernel::new(Arc::new(space(mock, reg)))
+    }
+
+    fn selected(kernel: &Kernel, needs: &str) -> String {
+        let out = issue(
+            kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                .with_arg("needs", ArgRef::Inline(needs.as_bytes().to_vec())),
+        );
+        String::from_utf8(out.bytes).unwrap()
+    }
+
+    #[test]
+    fn select_picks_the_cheapest_that_fits() {
+        let kernel = select_kernel(MockTransport::new(CANNED));
+        // seer and posh both see; seer is local (cheaper) -> wins.
+        assert_eq!(selected(&kernel, "vision"), "urn:llm:seer:ask");
+        // only posh has tools + vision.
+        assert_eq!(selected(&kernel, "vision, tools"), "urn:llm:posh:ask");
+        // fast and posh have >=100k context; fast is local -> wins. (32k = 32768.)
+        assert_eq!(selected(&kernel, "ctx>=100k"), "urn:llm:fast:ask");
+        // seer fits 32k exactly and ties with fast on cost; smaller context wins.
+        assert_eq!(
+            selected(&kernel, "ctx>=32k, cost<=cheap"),
+            "urn:llm:seer:ask"
+        );
+    }
+
+    #[test]
+    fn select_reports_no_match_and_bad_terms_clearly() {
+        let kernel = select_kernel(MockTransport::new(CANNED));
+        let no_match = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(b"audio".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        let msg = format!("{:?}", no_match.unwrap_err());
+        assert!(msg.contains("no configured backend satisfies"), "{msg}");
+        assert!(msg.contains("fast"), "lists providers: {msg}");
+
+        let bad_term = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(b"speed>=9".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(
+            bad_term.is_err(),
+            "unknown trait must error, not mis-select"
+        );
+    }
+
+    #[test]
+    fn select_as_json_returns_the_detail() {
+        let kernel = select_kernel(MockTransport::new(CANNED));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                .with_arg("needs", ArgRef::Inline(b"vision".to_vec()))
+                .with_arg("as", ArgRef::Inline(b"application/json".to_vec())),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["backend"], "urn:llm:seer:ask");
+        assert_eq!(v["model"], "llava:7b");
+    }
+
+    #[test]
+    fn the_facade_routes_by_needs() {
+        let mock = MockTransport::new(CANNED);
+        let kernel = select_kernel(Arc::clone(&mock));
+        let out = issue(
+            &kernel,
+            ask("urn:llm:ask", "hi").with_arg("needs", ArgRef::Inline(b"vision".to_vec())),
+        );
+        assert_eq!(out.bytes, b"Hello there!");
+        // the request went to seer's backend: the posted payload names its model.
+        let sent = mock.last.lock().unwrap().take().unwrap();
+        let body = String::from_utf8(sent.body).unwrap();
+        assert!(body.contains("llava:7b"), "routed to seer: {body}");
     }
 
     /// A transport whose server is unreachable — every send fails.
