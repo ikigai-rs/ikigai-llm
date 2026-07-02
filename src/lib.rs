@@ -148,9 +148,19 @@ impl OpenAiBackend {
 #[async_trait]
 impl Endpoint for OpenAiBackend {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        if !inv.capability.allows(CAP_NET) {
+        // Reaching a server — even localhost — is a network act, gated per-host by
+        // the same capability convention ikigai-http uses (urn:cap:net:<host>).
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let parsed = url::Url::parse(&url).map_err(|e| {
+            Error::Endpoint(format!("llm: bad base_url `{}`: {e}", self.config.base_url))
+        })?;
+        let host = parsed.host_str().unwrap_or("");
+        if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
             return Err(Error::Endpoint(format!(
-                "urn:llm:{}:ask requires the {CAP_NET} capability",
+                "urn:llm:{}:ask: capability does not allow reaching `{host}` (needs urn:cap:net:{host})",
                 self.config.provider
             )));
         }
@@ -184,10 +194,6 @@ impl Endpoint for OpenAiBackend {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
         }
 
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
         let body = serde_json::to_vec(&payload)
             .map_err(|e| Error::Endpoint(format!("llm: encoding request failed: {e}")))?;
         let response: HttpResponse = self
@@ -412,6 +418,16 @@ mod tests {
         let kernel = kernel_with(mock);
         let none = Capability::root().attenuate(Vec::<String>::new());
         let denied = block_on(kernel.issue(ask("urn:llm:ollama:ask", "hi"), &none));
-        assert!(denied.is_err(), "no cap:net -> denied");
+        assert!(denied.is_err(), "no net capability -> denied");
+    }
+
+    #[test]
+    fn a_host_scoped_capability_authorizes_that_host() {
+        let mock = MockTransport::new(CANNED);
+        let kernel = kernel_with(mock);
+        // Ollama's default base_url is http://localhost:11434/v1 -> host "localhost".
+        let scoped = Capability::root().attenuate(["urn:cap:net:localhost".to_string()]);
+        let out = block_on(kernel.issue(ask("urn:llm:ollama:ask", "hi"), &scoped)).unwrap();
+        assert_eq!(out.bytes, b"Hello there!");
     }
 }
