@@ -122,6 +122,19 @@ Selection is deterministic plain code over the registry — the SPARQL power pat
 is *composition*, not a dependency: `urn:llm:models as=text/turtle` is the same
 trait data as a queryable graph.
 
+## Installed models & the default-model fallback
+**`urn:llm:<provider>:installed`** lists what the provider can actually serve
+right now (`GET {base}/models` — newline list, pipeable; `as=application/json`
+for an array). It's the complement of `urn:llm:models`: *configured* vs
+*installed*. Live fact — uncacheable.
+
+And the backend resolves defaults against it: if a request **didn't name**
+`model=` and the configured default 404s (the demo moved machines; the model
+was never pulled), it lists what's installed and **retries once with the first
+available model**. An explicit `model=` is *never* substituted — that errors
+honestly. So a host's default config degrades to "use what's here" instead of
+failing on a hardcoded name.
+
 ## Liveness: `urn:llm:<provider>:up`
 A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
 else `false`. Built for `urn:fn:conditional`, so demos degrade gracefully:

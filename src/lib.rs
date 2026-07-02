@@ -332,6 +332,10 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
             .bind(
                 Exact::new(format!("urn:llm:{}:up", provider.provider)),
                 UpEndpoint::new(provider.clone(), Arc::clone(&transport)),
+            )
+            .bind(
+                Exact::new(format!("urn:llm:{}:installed", provider.provider)),
+                InstalledEndpoint::new(provider.clone(), Arc::clone(&transport)),
             );
     }
     space
@@ -464,18 +468,25 @@ impl Endpoint for OpenAiBackend {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
         }
 
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| Error::Endpoint(format!("llm: encoding request failed: {e}")))?;
-        let response: HttpResponse = self
-            .transport
-            .send(HttpRequest {
-                method: Method::Post,
-                url,
-                headers,
-                body,
-            })
-            .await
-            .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))?;
+        let explicit_model = inv.inline_str("model").is_ok();
+        let mut response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+
+        // The configured DEFAULT model may not exist on this machine's server
+        // (the demo moved hosts, the model was never pulled). A request that
+        // names `model=` explicitly errors honestly — never substitute — but a
+        // defaulted one resolves against what IS installed and retries once.
+        if response.status == 404 && !explicit_model {
+            let fallback = installed_models(self.transport.as_ref(), inv, &self.config)
+                .await
+                .ok()
+                .and_then(|models| models.into_iter().next());
+            if let Some(first) = fallback {
+                if first != model {
+                    payload["model"] = json!(first);
+                    response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+                }
+            }
+        }
 
         if response.status >= 400 {
             let detail = String::from_utf8_lossy(&response.body);
@@ -1111,6 +1122,130 @@ impl Endpoint for SelectEndpoint {
     }
 }
 
+/// POST a JSON payload to a provider, mapping transport failure to an endpoint
+/// error (a 4xx/5xx is still a response — callers decide).
+async fn post_json(
+    transport: &dyn HttpTransport,
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+) -> Result<HttpResponse> {
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| Error::Endpoint(format!("llm: encoding request failed: {e}")))?;
+    transport
+        .send(HttpRequest {
+            method: Method::Post,
+            url: url.to_string(),
+            headers: headers.to_vec(),
+            body,
+        })
+        .await
+        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))
+}
+
+/// The models actually available at the provider right now — `GET {base}/models`
+/// (the OpenAI-compat listing), ids in server order. Net-gated like every
+/// provider call. Backs `urn:llm:<provider>:installed` and the default-model
+/// fallback.
+async fn installed_models(
+    transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
+    config: &OpenAiConfig,
+) -> Result<Vec<String>> {
+    let url = require_net(
+        inv,
+        &config.base_url,
+        "models",
+        &format!("urn:llm:{}:installed", config.provider),
+    )?;
+    let response = transport
+        .send(HttpRequest {
+            method: Method::Get,
+            url,
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))?;
+    if response.status >= 400 {
+        return Err(Error::Endpoint(format!(
+            "urn:llm:{}:installed: provider returned {}",
+            config.provider, response.status
+        )));
+    }
+    let v: Value = serde_json::from_slice(&response.body)
+        .map_err(|e| Error::Endpoint(format!("llm: model list was not JSON: {e}")))?;
+    Ok(v["data"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// `urn:llm:<provider>:installed` — what the provider can actually serve right
+/// now, as a newline list (pipeable; `as=application/json` for an array). The
+/// complement of `urn:llm:models`: models/config say what's CONFIGURED, this
+/// says what's INSTALLED. Uncacheable — a live fact (pulls change it).
+pub struct InstalledEndpoint {
+    config: OpenAiConfig,
+    transport: Arc<dyn HttpTransport>,
+}
+
+impl InstalledEndpoint {
+    fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
+        InstalledEndpoint { config, transport }
+    }
+}
+
+#[async_trait]
+impl Endpoint for InstalledEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let models = installed_models(self.transport.as_ref(), inv, &self.config).await?;
+        let want_json = inv
+            .inline_str("as")
+            .map(|s| s.contains("json"))
+            .unwrap_or(false);
+        let (media, bytes) = if want_json {
+            (
+                "application/json",
+                serde_json::to_vec(&json!(models)).unwrap_or_default(),
+            )
+        } else {
+            ("text/plain", models.join("\n").into_bytes())
+        };
+        Ok(Representation::new(
+            ReprType::new(media).with_param("charset", "utf-8"),
+            bytes,
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "llm-installed"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(format!("urn:llm:{}:installed", self.config.provider))
+            .summary(
+                "The models the provider can actually serve right now (newline list; \
+                 as=application/json for an array). Live fact — uncacheable. The \
+                 complement of urn:llm:models: configured vs installed.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("as")
+                    .summary("text/plain newline list (default) or application/json")
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8")
+            .requires(CAP_NET)
+    }
+}
+
 // ---- liveness -----------------------------------------------------------------
 
 /// `urn:llm:<provider>:up` — a boolean liveness resource: `true` if the provider
@@ -1666,6 +1801,96 @@ mod tests {
             .find(|p| p.provider == "remote")
             .unwrap();
         assert_eq!(remote.caps.vendor.as_deref(), Some("openai"), "gap filled");
+    }
+
+    /// A transport that answers from a scripted queue (and logs every request)
+    /// — for flows that make several calls, like the default-model fallback.
+    struct QueueTransport {
+        responses: Mutex<std::collections::VecDeque<HttpResponse>>,
+        log: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl QueueTransport {
+        fn new(responses: Vec<(u16, &str)>) -> Arc<Self> {
+            Arc::new(QueueTransport {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(status, body)| HttpResponse {
+                            status,
+                            headers: vec![],
+                            body: body.as_bytes().to_vec(),
+                        })
+                        .collect(),
+                ),
+                log: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for QueueTransport {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.log.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| "queue exhausted".to_string())
+        }
+    }
+
+    const NOT_FOUND: &str = r#"{"error":{"message":"model "ghost" not found, try pulling it first","type":"api_error"}}"#;
+    const INSTALLED: &str = r#"{"object":"list","data":[{"id":"real:latest"},{"id":"other:7b"}]}"#;
+
+    #[test]
+    fn a_missing_default_model_falls_back_to_whats_installed() {
+        // The configured default ("ghost") isn't on this machine's server — the
+        // demo-moved-hosts case. Expect: 404 -> list installed -> retry with the
+        // first installed model -> answer.
+        let mock = QueueTransport::new(vec![(404, NOT_FOUND), (200, INSTALLED), (200, CANNED)]);
+        let mut config = OpenAiConfig::ollama("ghost");
+        config.provider = "o".to_string();
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, config)));
+        let out = issue(&kernel, ask("urn:llm:o:ask", "hi"));
+        assert_eq!(out.bytes, b"Hello there!");
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.len(), 3, "chat, list, retry");
+        assert!(log[1].url.ends_with("/models"), "listed what's installed");
+        let retry = String::from_utf8_lossy(&log[2].body).to_string();
+        assert!(
+            retry.contains("real:latest"),
+            "retried with the first installed: {retry}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_model_is_never_substituted() {
+        // model= was NAMED: a 404 must surface, not silently switch models.
+        let mock = QueueTransport::new(vec![(404, NOT_FOUND)]);
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, OpenAiConfig::ollama("llama3.1"))));
+        let denied = block_on(kernel.issue(
+            ask("urn:llm:ollama:ask", "hi").with_arg("model", ArgRef::Inline(b"ghost".to_vec())),
+            &Capability::root(),
+        ));
+        assert!(denied.is_err(), "explicit model + 404 must error");
+        assert_eq!(mock.log.lock().unwrap().len(), 1, "no fallback attempted");
+    }
+
+    #[test]
+    fn installed_lists_the_servers_models() {
+        let mock = MockTransport::new(INSTALLED);
+        let kernel = kernel_with(mock);
+        let out = issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").unwrap(),
+            ),
+        );
+        assert_eq!(out.bytes, b"real:latest\nother:7b");
     }
 
     /// A transport whose server is unreachable — every send fails.
