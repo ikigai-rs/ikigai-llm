@@ -22,6 +22,7 @@
 //! single-turn, `urn:cap:net`-gated. Generation is non-deterministic, so results
 //! are uncacheable by default (deterministic caching is a later slice).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ use ikigai_core::{
     Representation, Request, Result, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// The capability every backend call requires — reaching a server, even on
@@ -64,19 +66,104 @@ impl OpenAiConfig {
     }
 }
 
-/// Mount the LLM facade plus one OpenAI-compatible backend.
+/// A set of configured providers plus the default the facade routes to when a
+/// request names none. Built from compiled defaults ⊕ an optional hand-editable
+/// file — the load-time form of the "logical URI aliases to file-or-code" pattern.
+#[derive(Clone, Debug)]
+pub struct Registry {
+    /// The provider `urn:llm:ask` routes to when a request names none.
+    pub default: String,
+    /// Every configured backend; each is bound at `urn:llm:<provider>:ask`.
+    pub providers: Vec<OpenAiConfig>,
+}
+
+impl Registry {
+    /// A single-provider registry (that provider becomes the default).
+    pub fn single(config: OpenAiConfig) -> Self {
+        Registry {
+            default: config.provider.clone(),
+            providers: vec![config],
+        }
+    }
+
+    /// Parse a registry from JSON (the hand-editable config file):
+    ///
+    /// ```json
+    /// { "default": "fast",
+    ///   "providers": {
+    ///     "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
+    ///     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
+    ///   } }
+    /// ```
+    pub fn from_json(json: &str) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Entry {
+            base_url: String,
+            #[serde(alias = "default_model")]
+            model: String,
+            #[serde(default)]
+            api_key: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Doc {
+            default: String,
+            providers: BTreeMap<String, Entry>,
+        }
+        let doc: Doc = serde_json::from_str(json)
+            .map_err(|e| Error::Endpoint(format!("urn:llm:config: invalid JSON: {e}")))?;
+        let providers = doc
+            .providers
+            .into_iter()
+            .map(|(name, e)| OpenAiConfig {
+                provider: name,
+                base_url: e.base_url,
+                default_model: e.model,
+                api_key: e.api_key,
+            })
+            .collect();
+        Ok(Registry {
+            default: doc.default,
+            providers,
+        })
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Registry::single(OpenAiConfig::ollama("llama3.2"))
+    }
+}
+
+impl From<OpenAiConfig> for Registry {
+    fn from(config: OpenAiConfig) -> Self {
+        Registry::single(config)
+    }
+}
+
+/// Mount the LLM facade, one backend per configured provider, and the config
+/// resource.
 ///
-/// Binds `urn:llm:ask` (the facade) and `urn:llm:<provider>:ask` (the backend,
-/// directly addressable). The host supplies the [`HttpTransport`].
-pub fn space(transport: Arc<dyn HttpTransport>, config: OpenAiConfig) -> EndpointSpace {
-    let backend_iri = format!("urn:llm:{}:ask", config.provider);
-    let facade = AskFacade::new(&config.provider);
-    EndpointSpace::new()
-        .bind(Exact::new("urn:llm:ask"), facade)
+/// Binds `urn:llm:ask` (the facade), a `urn:llm:<provider>:ask` for every provider
+/// in the registry (each directly addressable and catalog-advertised with its own
+/// model/base_url), and `urn:llm:config` (the effective registry, keys redacted).
+/// Accepts a [`Registry`] or — via `From<OpenAiConfig>` — a single [`OpenAiConfig`].
+/// The host supplies the [`HttpTransport`].
+pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -> EndpointSpace {
+    let registry = registry.into();
+    let mut space = EndpointSpace::new()
+        .bind(Exact::new("urn:llm:ask"), AskFacade::new(&registry.default))
         .bind(
-            Exact::new(backend_iri),
-            OpenAiBackend::new(config, transport),
-        )
+            Exact::new("urn:llm:config"),
+            ConfigEndpoint::new(registry.clone()),
+        );
+    for provider in &registry.providers {
+        let iri = format!("urn:llm:{}:ask", provider.provider);
+        space = space.bind(
+            Exact::new(iri),
+            OpenAiBackend::new(provider.clone(), Arc::clone(&transport)),
+        );
+    }
+    space
 }
 
 // ---- the facade -------------------------------------------------------------
@@ -306,10 +393,62 @@ fn ask_description(id: &str, summary: &str) -> Description {
         .requires(CAP_NET)
 }
 
+// ---- the config resource ----------------------------------------------------
+
+/// `urn:llm:config` — reports the effective registry (default + configured
+/// providers), with API keys **redacted** so the resource never leaks a secret.
+pub struct ConfigEndpoint {
+    registry: Registry,
+}
+
+impl ConfigEndpoint {
+    fn new(registry: Registry) -> Self {
+        ConfigEndpoint { registry }
+    }
+}
+
+#[async_trait]
+impl Endpoint for ConfigEndpoint {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        let mut providers = serde_json::Map::new();
+        for p in &self.registry.providers {
+            providers.insert(
+                p.provider.clone(),
+                json!({
+                    "base_url": p.base_url,
+                    "model": p.default_model,
+                    "api_key": p.api_key.as_ref().map(|_| "***"),
+                }),
+            );
+        }
+        let out = json!({ "default": self.registry.default, "providers": providers });
+        Ok(Representation::new(
+            ReprType::new("application/json").with_param("charset", "utf-8"),
+            serde_json::to_vec(&out).unwrap_or_default(),
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "llm-config"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:llm:config")
+            .summary(
+                "The effective LLM provider registry (default + configured backends; \
+                 API keys redacted).",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/json")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ikigai_core::{ArgRef, Capability, Kernel};
+    use ikigai_core::{ArgRef, Capability, Kernel, Space};
     use std::sync::Mutex;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -429,5 +568,65 @@ mod tests {
         let scoped = Capability::root().attenuate(["urn:cap:net:localhost".to_string()]);
         let out = block_on(kernel.issue(ask("urn:llm:ollama:ask", "hi"), &scoped)).unwrap();
         assert_eq!(out.bytes, b"Hello there!");
+    }
+
+    const TWO_PROVIDERS: &str = r#"{
+        "default": "fast",
+        "providers": {
+            "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
+            "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "sk-SECRET" }
+        }
+    }"#;
+
+    #[test]
+    fn from_json_parses_a_multi_provider_registry() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        assert_eq!(reg.default, "fast");
+        assert_eq!(reg.providers.len(), 2);
+        let remote = reg
+            .providers
+            .iter()
+            .find(|p| p.provider == "remote")
+            .unwrap();
+        assert_eq!(remote.default_model, "gpt-4o");
+        assert_eq!(remote.api_key.as_deref(), Some("sk-SECRET"));
+    }
+
+    #[test]
+    fn space_advertises_one_backend_per_provider() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let patterns: Vec<String> = space(MockTransport::new(CANNED), reg)
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.pattern)
+            .collect();
+        for expected in [
+            "urn:llm:ask",
+            "urn:llm:config",
+            "urn:llm:fast:ask",
+            "urn:llm:remote:ask",
+        ] {
+            assert!(patterns.iter().any(|p| p == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn config_resource_reports_providers_with_keys_redacted() {
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(CANNED), reg)));
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:llm:config").unwrap()),
+            &Capability::root(),
+        ))
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["default"], "fast");
+        assert_eq!(v["providers"]["remote"]["api_key"], "***");
+        assert_eq!(v["providers"]["fast"]["api_key"], Value::Null);
+        assert!(
+            !String::from_utf8_lossy(&out.bytes).contains("sk-SECRET"),
+            "the real key must never appear"
+        );
     }
 }
