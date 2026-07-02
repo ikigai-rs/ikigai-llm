@@ -1,0 +1,23 @@
+[package]
+name = "ikigai-llm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+description = "Flexible LLM inference as ikigai ROC resources: urn:llm:ask (a facade grammar) dispatches to pluggable backends. Slice 0 ships an OpenAI-compatible REST backend covering Ollama / vLLM / llama.cpp-server / mlx_lm.server / LM Studio."
+repository = "https://github.com/ikigai-rs/ikigai-llm"
+homepage = "https://github.com/ikigai-rs/ikigai-llm"
+keywords = ["ikigai", "roc", "llm", "inference", "ollama"]
+categories = ["web-programming"]
+
+[dependencies]
+ikigai-core = "0.1.32"
+# The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
+# (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
+# client or executor baked into this crate.
+ikigai-http = "0.1.1"
+async-trait = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+futures = "0.3"
