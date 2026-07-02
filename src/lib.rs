@@ -58,6 +58,12 @@ pub struct Caps {
     /// Cost tier: `local` | `cheap` | `premium`.
     #[serde(default)]
     pub cost: Option<String>,
+    /// The service behind the endpoint (`ollama`, `openai`, `anthropic`, `mlx`, …)
+    /// — the governance axis: `vendor!=openai` in a `needs=` expression excludes
+    /// it, and a provider that *didn't declare* a vendor can't pass the exclusion
+    /// (it might be that vendor).
+    #[serde(default)]
+    pub vendor: Option<String>,
     /// Display-only parameter count, e.g. `"3B"`, `"70B"`.
     #[serde(default)]
     pub params: Option<String>,
@@ -92,6 +98,7 @@ impl OpenAiConfig {
             api_key: None,
             caps: Caps {
                 cost: Some("local".to_string()),
+                vendor: Some("ollama".to_string()),
                 ..Caps::default()
             },
         }
@@ -530,6 +537,7 @@ impl ModelsEndpoint {
                         "tools": caps.tools,
                         "json": caps.json,
                         "cost": caps.cost,
+                        "vendor": caps.vendor,
                         "params": caps.params,
                     },
                 }),
@@ -562,6 +570,9 @@ impl ModelsEndpoint {
             }
             if let Some(c) = &p.caps.cost {
                 props.push(format!("ik:cost {}", ttl_str(c)));
+            }
+            if let Some(v) = &p.caps.vendor {
+                props.push(format!("ik:vendor {}", ttl_str(v)));
             }
             if let Some(pr) = &p.caps.params {
                 props.push(format!("ik:params {}", ttl_str(pr)));
@@ -645,6 +656,15 @@ enum Need {
     Tools,
     /// `json` — declared structured-output mode.
     Json,
+    /// `vendor=ollama` — the declared vendor must be exactly this.
+    VendorIs(String),
+    /// `vendor!=openai` — governance exclusion: the declared vendor must differ.
+    /// A provider that declared NO vendor fails this (it might be that vendor).
+    VendorNot(String),
+    /// `provider=fast` — this registry entry by name.
+    ProviderIs(String),
+    /// `provider!=posh` — any registry entry but this one.
+    ProviderNot(String),
 }
 
 /// The cost-tier ordering selection reasons over.
@@ -695,12 +715,20 @@ fn parse_needs(expr: &str) -> Result<Vec<Need>> {
                 ),
                 other => return Err(bad(term, &format!("`{other}` does not support <="))),
             }
+        } else if let Some((k, v)) = term.split_once("!=") {
+            match k.trim() {
+                "vendor" => Need::VendorNot(v.trim().to_string()),
+                "provider" => Need::ProviderNot(v.trim().to_string()),
+                other => return Err(bad(term, &format!("`{other}` does not support !="))),
+            }
         } else if let Some((k, v)) = term.split_once('=') {
             match k.trim() {
                 "cost" => Need::CostExactly(
                     cost_rank(v.trim()).ok_or_else(|| bad(term, "expected local|cheap|premium"))?,
                 ),
                 "modality" => Need::Modality(v.trim().to_string()),
+                "vendor" => Need::VendorIs(v.trim().to_string()),
+                "provider" => Need::ProviderIs(v.trim().to_string()),
                 other => return Err(bad(term, &format!("unknown trait `{other}`"))),
             }
         } else {
@@ -716,9 +744,11 @@ fn parse_needs(expr: &str) -> Result<Vec<Need>> {
     Ok(needs)
 }
 
-/// Does a declared profile satisfy every need? Conservative: a trait the
-/// provider didn't declare cannot satisfy a requirement on it.
-fn caps_satisfy(caps: &Caps, needs: &[Need]) -> bool {
+/// Does a provider satisfy every need? Conservative: a trait it didn't declare
+/// cannot satisfy a requirement on it — including a `vendor!=` exclusion, which
+/// an undeclared vendor FAILS (it might be the excluded vendor).
+fn satisfies(provider: &OpenAiConfig, needs: &[Need]) -> bool {
+    let caps = &provider.caps;
     needs.iter().all(|need| match need {
         Need::ContextAtLeast(n) => caps.context.is_some_and(|c| c >= *n),
         Need::CostAtMost(r) => caps
@@ -730,6 +760,10 @@ fn caps_satisfy(caps: &Caps, needs: &[Need]) -> bool {
         Need::Modality(m) => caps.modalities.iter().any(|x| x == m),
         Need::Tools => caps.tools == Some(true),
         Need::Json => caps.json == Some(true),
+        Need::VendorIs(v) => caps.vendor.as_deref() == Some(v.as_str()),
+        Need::VendorNot(v) => caps.vendor.as_deref().is_some_and(|x| x != v),
+        Need::ProviderIs(n) => provider.provider == *n,
+        Need::ProviderNot(n) => provider.provider != *n,
     })
 }
 
@@ -740,7 +774,7 @@ fn select<'a>(registry: &'a Registry, needs: &[Need]) -> Option<&'a OpenAiConfig
         .providers
         .iter()
         .enumerate()
-        .filter(|(_, p)| caps_satisfy(&p.caps, needs))
+        .filter(|(_, p)| satisfies(p, needs))
         .min_by_key(|(i, p)| {
             (
                 p.caps.cost.as_deref().and_then(cost_rank).unwrap_or(3),
@@ -796,6 +830,7 @@ impl Endpoint for SelectEndpoint {
                 "provider": winner.provider,
                 "model": winner.default_model,
                 "cost": winner.caps.cost,
+                "vendor": winner.caps.vendor,
                 "context": winner.caps.context,
             });
             (
@@ -830,7 +865,8 @@ impl Endpoint for SelectEndpoint {
             .verb(Verb::Meta)
             .input(ArgSpec::new("needs").summary(
                 "comma-separated requirements: ctx>=N[k] · cost<=tier · cost=tier · \
-                 modality=X (or bare text/vision/audio) · tools · json",
+                 modality=X (or bare text/vision/audio) · tools · json · vendor=X · \
+                 vendor!=X (governance: e.g. no openai) · provider=name · provider!=name",
             ))
             .input(
                 ArgSpec::new("as")
@@ -1150,11 +1186,11 @@ mod tests {
         "default": "fast",
         "providers": {
             "fast": { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
-                      "caps": { "context": 131072, "modalities": ["text"], "cost": "local" } },
+                      "caps": { "context": 131072, "modalities": ["text"], "cost": "local", "vendor": "ollama" } },
             "seer": { "base_url": "http://localhost:11434/v1", "model": "llava:7b",
-                      "caps": { "context": 32768, "modalities": ["text", "vision"], "cost": "local" } },
+                      "caps": { "context": 32768, "modalities": ["text", "vision"], "cost": "local", "vendor": "ollama" } },
             "posh": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "sk-S",
-                      "caps": { "context": 131072, "modalities": ["text", "vision"], "tools": true, "cost": "premium" } }
+                      "caps": { "context": 131072, "modalities": ["text", "vision"], "tools": true, "cost": "premium", "vendor": "openai" } }
         }
     }"#;
 
@@ -1186,6 +1222,47 @@ mod tests {
             selected(&kernel, "ctx>=32k, cost<=cheap"),
             "urn:llm:seer:ask"
         );
+    }
+
+    #[test]
+    fn vendor_and_provider_constraints_apply() {
+        let kernel = select_kernel(MockTransport::new(CANNED));
+        // Governance: no openai. posh is excluded; among fast/seer (both local)
+        // the smaller context wins.
+        assert_eq!(selected(&kernel, "vendor!=openai"), "urn:llm:seer:ask");
+        // ...and combined with a trait only posh has -> nothing fits.
+        let none = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(b"tools, vendor!=openai".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(none.is_err(), "tools only exists at openai here");
+        // Vendor inclusion and provider-name terms.
+        assert_eq!(selected(&kernel, "vendor=openai"), "urn:llm:posh:ask");
+        assert_eq!(selected(&kernel, "provider=fast"), "urn:llm:fast:ask");
+        assert_eq!(
+            selected(&kernel, "provider!=seer, vendor!=openai"),
+            "urn:llm:fast:ask"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_vendor_cannot_pass_a_vendor_exclusion() {
+        // TWO_PROVIDERS' `remote` declares NO vendor: it must not pass
+        // `vendor!=openai` — it might BE openai. (fast declares none either, so
+        // nothing matches.)
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(CANNED), reg)));
+        let none = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(b"vendor!=openai".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(none.is_err(), "undeclared vendor must fail the exclusion");
     }
 
     #[test]

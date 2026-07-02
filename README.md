@@ -87,10 +87,20 @@ source urn:llm:ask needs="ctx>=100k" prompt="…"                 -> asks the wi
 
 Grammar (comma-separated): `ctx>=N` (or `Nk` = ×1024) · `cost<=tier` / `cost=tier`
 (`local` < `cheap` < `premium`) · `modality=x` or bare `text`/`vision`/`audio` ·
-`tools` · `json`. Unknown terms **error** (a typo must not mis-select); a trait a
-provider didn't declare can't satisfy a requirement on it. Policy among matches:
-**cheapest-that-fits → smallest context → registry order**. Routing precedence on
-the facade: `provider=` → `needs=` → the configured default.
+`tools` · `json` · **`vendor=x` / `vendor!=x`** (the governance axis — a provider
+declares its `vendor` in caps, e.g. `ollama`/`openai`/`anthropic`, and
+`vendor!=openai` means *this prompt never goes to OpenAI*) · `provider=name` /
+`provider!=name` (registry entries by your local names).
+
+Unknown terms **error** (a typo must not mis-select); a trait a provider didn't
+declare can't satisfy a requirement on it — **including `vendor!=`**: an
+undeclared vendor fails the exclusion, because it might *be* that vendor. Policy
+among matches: **cheapest-that-fits → smallest context → registry order**.
+Routing precedence on the facade: `provider=` → `needs=` → the configured default.
+
+```text
+source urn:llm:ask needs="ctx>=32k, vendor!=openai" prompt="…"   # governance-constrained ask
+```
 
 Selection is deterministic plain code over the registry — the SPARQL power path
 is *composition*, not a dependency: `urn:llm:models as=text/turtle` is the same
