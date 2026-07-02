@@ -21,3 +21,6 @@ serde_json = "1"
 
 [dev-dependencies]
 futures = "0.3"
+# A blocking HTTP client for the `ask` example's live smoke test (a real
+# HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
+ureq = "2"
