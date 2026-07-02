@@ -71,9 +71,25 @@ Each provider may declare a **`caps`** profile — `context` (tokens), `modaliti
 `params` (`"3B"`) — the traits selection will reason over. **`urn:llm:models`**
 is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 **queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
-`ik:modality` · `ik:tools` · `ik:cost`), so "a vision model with ≥32k context"
-becomes a SPARQL query over a resource. Caps are declared (config-authored);
-provider auto-discovery fills gaps in a later slice, declared-wins.
+`ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor`), so "a vision model with
+≥32k context" becomes a SPARQL query over a resource.
+
+Trait facts arrive at three strengths — **annotations > declared > discovered**:
+
+- **Discovered** (weakest, gaps only): a provider that declares `vendor:
+  "ollama"` opts into live discovery via Ollama's native `/api/show` — context
+  length, vision/tools capabilities, parameter size — merged declared-wins.
+  Graceful: server down or capability missing → the declared profile stands.
+  (The vendor declaration is the opt-in; unknown vendors are never probed with
+  your model names.)
+- **Declared**: the config file's `caps` block.
+- **Annotations** (strongest): `Registry::apply_annotations(facts)` takes triples
+  from an alignment/annotation graph (subjects are the trait-graph's own
+  `urn:llm:<name>:ask` IRIs, or bare provider names) and **completes or corrects**
+  under-specified descriptions — an override is never silent: every conflict is
+  returned for the host to log. `modality` facts union in. So a config that
+  forgot `vendor` on a remote can be fixed from the graph, and `vendor!=openai`
+  then correctly excludes it instead of conservatively failing everything.
 
 ## Capability-based selection: `urn:llm:select` & `needs=`
 Stop naming models — state requirements. **`urn:llm:select needs="…"`** resolves a
@@ -120,8 +136,9 @@ an error, not `false` (denied ≠ down).
 ## Design & roadmap
 The facade is the imperative seed of the interception/rewrite primitive: a static
 alias would be a `Rewrite` space, but selection that reads args/config is an
-endpoint whose `invoke` does the rewrite. Deferred: **Ollama auto-discovery**
-(`/api/show` fills caps, declared-wins), **live-reload** (make `urn:llm:config` a
+endpoint whose `invoke` does the rewrite. Deferred: **value subsumption in
+selection** (`ik:AzureOpenAI ⊑ ik:OpenAI` so `vendor!=openai` closes over the
+hierarchy; `ik:Vision ⊑ ik:Multimodal`), **live-reload** (make `urn:llm:config` a
 live resource that sources the file under a golden thread), **transrepted config**
 (author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,
 deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX (pyo3),

@@ -38,9 +38,10 @@ use serde_json::{json, Value};
 /// localhost, is a network act.
 const CAP_NET: &str = "urn:cap:net";
 
-/// A backend's capability profile — the traits selection reasons over. All
-/// **declared** (config-authored) for now; provider auto-discovery (e.g. Ollama's
-/// `/api/show`) is a later slice that fills gaps, declared-wins.
+/// A backend's capability profile — the traits selection reasons over. Facts
+/// arrive at three strengths: **annotations** (an alignment graph, authoritative
+/// — may override, loudly) > **declared** (config-authored) > **discovered**
+/// (Ollama's `/api/show`, fills gaps only).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Caps {
     /// Context window, in tokens.
@@ -170,6 +171,119 @@ impl Registry {
     }
 }
 
+/// An annotation overrode a declared value — reported so the host can log the
+/// conflict (annotations are authoritative, but never silently).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotationConflict {
+    /// The provider whose trait was overridden.
+    pub provider: String,
+    /// The trait, e.g. `vendor`, `context`.
+    pub trait_name: String,
+    /// What the config declared.
+    pub declared: String,
+    /// What the annotation asserts (now in effect).
+    pub annotated: String,
+}
+
+impl Registry {
+    /// Apply annotation facts — triples from an alignment/annotation graph that
+    /// complete or correct under-specified provider descriptions.
+    ///
+    /// Each fact is `(subject, predicate, object)`: the subject is a backend IRI
+    /// (`urn:llm:<name>:ask`, as emitted by `urn:llm:models`) or a bare provider
+    /// name; the predicate is an `ik:` trait (full IRI, `ik:`-prefixed, or bare —
+    /// `vendor` · `cost` · `context` · `tools` · `jsonMode`/`json` · `modality` ·
+    /// `params`). **Annotations are authoritative**: they fill gaps AND override
+    /// declared values — every override is returned as an [`AnnotationConflict`]
+    /// for the host to log. `modality` facts union in (never a conflict); unknown
+    /// subjects and predicates are ignored (an annotation graph may say more
+    /// about the world than this registry knows).
+    pub fn apply_annotations<S: AsRef<str>>(
+        &mut self,
+        facts: &[(S, S, S)],
+    ) -> Vec<AnnotationConflict> {
+        fn local_name(predicate: &str) -> &str {
+            let p = predicate
+                .rsplit_once('#')
+                .map_or(predicate, |(_, local)| local);
+            p.rsplit_once(':').map_or(p, |(_, local)| local)
+        }
+        let mut conflicts = Vec::new();
+        for (subject, predicate, object) in facts {
+            let (subject, object) = (subject.as_ref(), object.as_ref().to_string());
+            let Some(provider) = self.providers.iter_mut().find(|p| {
+                subject == p.provider || subject == format!("urn:llm:{}:ask", p.provider)
+            }) else {
+                continue;
+            };
+            let mut set_str = |field: &mut Option<String>, name: &str, value: String| {
+                if let Some(old) = field.as_deref() {
+                    if old != value {
+                        conflicts.push(AnnotationConflict {
+                            provider: provider.provider.clone(),
+                            trait_name: name.to_string(),
+                            declared: old.to_string(),
+                            annotated: value.clone(),
+                        });
+                    }
+                }
+                *field = Some(value);
+            };
+            match local_name(predicate.as_ref()) {
+                "vendor" => set_str(&mut provider.caps.vendor, "vendor", object),
+                "cost" => set_str(&mut provider.caps.cost, "cost", object),
+                "params" => set_str(&mut provider.caps.params, "params", object),
+                "context" => {
+                    if let Ok(n) = object.parse::<u64>() {
+                        if let Some(old) = provider.caps.context {
+                            if old != n {
+                                conflicts.push(AnnotationConflict {
+                                    provider: provider.provider.clone(),
+                                    trait_name: "context".to_string(),
+                                    declared: old.to_string(),
+                                    annotated: object,
+                                });
+                            }
+                        }
+                        provider.caps.context = Some(n);
+                    }
+                }
+                "tools" | "jsonMode" | "json" => {
+                    if let Ok(b) = object.parse::<bool>() {
+                        let field = if local_name(predicate.as_ref()) == "tools" {
+                            &mut provider.caps.tools
+                        } else {
+                            &mut provider.caps.json
+                        };
+                        let name = if local_name(predicate.as_ref()) == "tools" {
+                            "tools"
+                        } else {
+                            "json"
+                        };
+                        if let Some(old) = *field {
+                            if old != b {
+                                conflicts.push(AnnotationConflict {
+                                    provider: provider.provider.clone(),
+                                    trait_name: name.to_string(),
+                                    declared: old.to_string(),
+                                    annotated: object,
+                                });
+                            }
+                        }
+                        *field = Some(b);
+                    }
+                }
+                // Additive: modalities are a set, an assertion joins it.
+                "modality" if !provider.caps.modalities.contains(&object) => {
+                    provider.caps.modalities.push(object);
+                }
+                _ => {}
+            }
+        }
+        conflicts
+    }
+}
+
 impl Default for Registry {
     fn default() -> Self {
         Registry::single(OpenAiConfig::ollama("llama3.2"))
@@ -193,18 +307,21 @@ impl From<OpenAiConfig> for Registry {
 pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -> EndpointSpace {
     let registry = registry.into();
     let mut space = EndpointSpace::new()
-        .bind(Exact::new("urn:llm:ask"), AskFacade::new(registry.clone()))
+        .bind(
+            Exact::new("urn:llm:ask"),
+            AskFacade::new(registry.clone(), Arc::clone(&transport)),
+        )
         .bind(
             Exact::new("urn:llm:config"),
             ConfigEndpoint::new(registry.clone()),
         )
         .bind(
             Exact::new("urn:llm:models"),
-            ModelsEndpoint::new(registry.clone()),
+            ModelsEndpoint::new(registry.clone(), Arc::clone(&transport)),
         )
         .bind(
             Exact::new("urn:llm:select"),
-            SelectEndpoint::new(registry.clone()),
+            SelectEndpoint::new(registry.clone(), Arc::clone(&transport)),
         );
     for provider in &registry.providers {
         space = space
@@ -227,13 +344,18 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
 /// re-issues the request to `urn:llm:<provider>:ask`.
 pub struct AskFacade {
     registry: Registry,
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl AskFacade {
     /// A facade over `registry`: routes by `provider=`, else resolves `needs=`
-    /// against the trait profiles, else falls back to the registry's default.
-    pub fn new(registry: Registry) -> Self {
-        AskFacade { registry }
+    /// against the trait profiles (declared ⊕ discovered), else falls back to the
+    /// registry's default. The transport is used only for trait discovery.
+    pub fn new(registry: Registry, transport: Arc<dyn HttpTransport>) -> Self {
+        AskFacade {
+            registry,
+            transport,
+        }
     }
 }
 
@@ -245,8 +367,9 @@ impl Endpoint for AskFacade {
         let provider = if let Ok(name) = inv.inline_str("provider") {
             name.to_string()
         } else if let Ok(needs) = inv.inline_str("needs") {
-            select(&self.registry, &parse_needs(needs)?)
-                .ok_or_else(|| no_match_error("urn:llm:ask", needs, &self.registry))?
+            let effective = effective_registry(&self.registry, &self.transport, inv).await;
+            select(&effective, &parse_needs(needs)?)
+                .ok_or_else(|| no_match_error("urn:llm:ask", needs, &effective))?
                 .provider
                 .clone()
         } else {
@@ -514,16 +637,20 @@ impl Endpoint for ConfigEndpoint {
 /// Config-derived, so cacheable until the registry changes (a restart, for now).
 pub struct ModelsEndpoint {
     registry: Registry,
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl ModelsEndpoint {
-    fn new(registry: Registry) -> Self {
-        ModelsEndpoint { registry }
+    fn new(registry: Registry, transport: Arc<dyn HttpTransport>) -> Self {
+        ModelsEndpoint {
+            registry,
+            transport,
+        }
     }
 
-    fn as_json(&self) -> Value {
+    fn as_json(registry: &Registry) -> Value {
         let mut models = serde_json::Map::new();
-        for p in &self.registry.providers {
+        for p in &registry.providers {
             let caps = &p.caps;
             models.insert(
                 p.provider.clone(),
@@ -543,15 +670,15 @@ impl ModelsEndpoint {
                 }),
             );
         }
-        json!({ "default": self.registry.default, "models": models })
+        json!({ "default": registry.default, "models": models })
     }
 
     /// The trait graph. Vocabulary is module-local for now (`ik:LlmBackend`,
     /// `ik:model`, `ik:context`, `ik:modality`, `ik:tools`, `ik:jsonMode`,
     /// `ik:cost`, `ik:params`) — promotion into ikigai-vocab is a follow-up.
-    fn as_turtle(&self) -> String {
+    fn as_turtle(registry: &Registry) -> String {
         let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
-        for p in &self.registry.providers {
+        for p in &registry.providers {
             let mut props = vec![
                 "a ik:LlmBackend".to_string(),
                 format!("ik:model {}", ttl_str(&p.default_model)),
@@ -585,7 +712,7 @@ impl ModelsEndpoint {
         }
         ttl.push_str(&format!(
             "\n<urn:llm:ask> ik:routesTo <urn:llm:{}:ask> .\n",
-            self.registry.default
+            registry.default
         ));
         ttl
     }
@@ -599,16 +726,19 @@ fn ttl_str(s: &str) -> String {
 #[async_trait]
 impl Endpoint for ModelsEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // The inventory is declared ⊕ discovered — gaps filled live from the
+        // provider (Ollama /api/show) where declared vendor + capability allow.
+        let effective = effective_registry(&self.registry, &self.transport, inv).await;
         let want_turtle = inv
             .inline_str("as")
             .map(|s| s.contains("turtle"))
             .unwrap_or(false);
         let (media, bytes) = if want_turtle {
-            ("text/turtle", self.as_turtle().into_bytes())
+            ("text/turtle", Self::as_turtle(&effective).into_bytes())
         } else {
             (
                 "application/json",
-                serde_json::to_vec(&self.as_json()).unwrap_or_default(),
+                serde_json::to_vec(&Self::as_json(&effective)).unwrap_or_default(),
             )
         };
         Ok(
@@ -637,6 +767,105 @@ impl Endpoint for ModelsEndpoint {
             )
             .output("application/json")
     }
+}
+
+// ---- trait discovery (Ollama /api/show) --------------------------------------
+
+/// Traits discovered from Ollama's native `/api/show`: context length (from
+/// `model_info.*.context_length`), modalities and tool support (from
+/// `capabilities`), and the parameter size. Only attempted for providers that
+/// **declare** `vendor: "ollama"` — that declaration is the opt-in that the
+/// native API exists; we never probe an unknown vendor with a model name. Only
+/// where the capability allows the host; graceful on any failure (None).
+async fn discovered_caps(
+    transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
+    provider: &OpenAiConfig,
+) -> Option<Caps> {
+    if provider.caps.vendor.as_deref() != Some("ollama") {
+        return None;
+    }
+    // The native API lives at the server root, not under the OpenAI-compat /v1.
+    let root = provider
+        .base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1");
+    let url = format!("{root}/api/show");
+    let parsed = url::Url::parse(&url).ok()?;
+    let host = parsed.host_str().unwrap_or("");
+    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+        return None; // no capability -> no discovery; declared profile stands
+    }
+    let body = serde_json::to_vec(&json!({ "model": provider.default_model })).ok()?;
+    let response = transport
+        .send(HttpRequest {
+            method: Method::Post,
+            url,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body,
+        })
+        .await
+        .ok()?;
+    if response.status >= 400 {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&response.body).ok()?;
+    let mut caps = Caps::default();
+    if let Some(info) = v["model_info"].as_object() {
+        caps.context = info
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length"))
+            .and_then(|(_, val)| val.as_u64());
+    }
+    if let Some(list) = v["capabilities"].as_array() {
+        let has = |name: &str| list.iter().any(|c| c.as_str() == Some(name));
+        caps.modalities = if has("vision") {
+            vec!["text".to_string(), "vision".to_string()]
+        } else {
+            vec!["text".to_string()]
+        };
+        caps.tools = Some(has("tools"));
+    }
+    caps.params = v["details"]["parameter_size"]
+        .as_str()
+        .map(|s| s.to_string());
+    Some(caps)
+}
+
+/// Declared ⊕ discovered, **declared-wins**: discovery only fills gaps. (The
+/// annotation layer sits ABOVE declared and may override — the precedence
+/// ladder is annotations > declared > discovered.)
+fn merge_declared_wins(declared: &Caps, discovered: Caps) -> Caps {
+    Caps {
+        context: declared.context.or(discovered.context),
+        modalities: if declared.modalities.is_empty() {
+            discovered.modalities
+        } else {
+            declared.modalities.clone()
+        },
+        tools: declared.tools.or(discovered.tools),
+        json: declared.json.or(discovered.json),
+        cost: declared.cost.clone().or(discovered.cost),
+        vendor: declared.vendor.clone().or(discovered.vendor),
+        params: declared.params.clone().or(discovered.params),
+    }
+}
+
+/// This invocation's view of the registry: every provider's declared profile
+/// with discovered gaps filled. What `urn:llm:models` reports and selection
+/// reasons over.
+async fn effective_registry(
+    registry: &Registry,
+    transport: &Arc<dyn HttpTransport>,
+    inv: &Invocation<'_>,
+) -> Registry {
+    let mut effective = registry.clone();
+    for provider in &mut effective.providers {
+        if let Some(found) = discovered_caps(transport.as_ref(), inv, provider).await {
+            provider.caps = merge_declared_wins(&provider.caps, found);
+        }
+    }
+    effective
 }
 
 // ---- capability-based selection -------------------------------------------------
@@ -806,11 +1035,15 @@ fn no_match_error(who: &str, needs: &str, registry: &Registry) -> Error {
 /// as=text/turtle` is the same trait data as a queryable graph.)
 pub struct SelectEndpoint {
     registry: Registry,
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl SelectEndpoint {
-    fn new(registry: Registry) -> Self {
-        SelectEndpoint { registry }
+    fn new(registry: Registry, transport: Arc<dyn HttpTransport>) -> Self {
+        SelectEndpoint {
+            registry,
+            transport,
+        }
     }
 }
 
@@ -818,8 +1051,9 @@ impl SelectEndpoint {
 impl Endpoint for SelectEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let needs = inv.inline_str("needs")?;
-        let winner = select(&self.registry, &parse_needs(needs)?)
-            .ok_or_else(|| no_match_error("urn:llm:select", needs, &self.registry))?;
+        let effective = effective_registry(&self.registry, &self.transport, inv).await;
+        let winner = select(&effective, &parse_needs(needs)?)
+            .ok_or_else(|| no_match_error("urn:llm:select", needs, &effective))?;
         let want_json = inv
             .inline_str("as")
             .map(|s| s.contains("json"))
@@ -1319,6 +1553,119 @@ mod tests {
         let sent = mock.last.lock().unwrap().take().unwrap();
         let body = String::from_utf8(sent.body).unwrap();
         assert!(body.contains("llava:7b"), "routed to seer: {body}");
+    }
+
+    /// What Ollama's native `/api/show` answers for a 3B tool-capable model.
+    const SHOW: &str = r#"{"details":{"parameter_size":"3.2B"},"model_info":{"llama.context_length":131072},"capabilities":["completion","tools"]}"#;
+
+    #[test]
+    fn discovery_fills_gaps_and_declared_wins() {
+        // Declared: vendor ollama + cost local + context 999 — nothing else.
+        let reg = Registry::from_json(
+            r#"{ "default": "o", "providers": { "o": {
+                "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+                "caps": { "vendor": "ollama", "cost": "local", "context": 999 } } } }"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(SHOW), reg)));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        let caps = &v["models"]["o"]["caps"];
+        assert_eq!(
+            caps["context"], 999,
+            "declared context wins over discovered"
+        );
+        assert_eq!(caps["tools"], true, "tools discovered from /api/show");
+        assert_eq!(caps["params"], "3.2B", "params discovered");
+        assert_eq!(caps["cost"], "local", "declared cost untouched");
+    }
+
+    #[test]
+    fn discovery_only_probes_declared_ollama_vendors() {
+        // No vendor declared -> no /api/show probe is ever sent.
+        let reg = Registry::from_json(
+            r#"{ "default": "x", "providers": { "x": {
+                "base_url": "http://localhost:8000/v1", "model": "m" } } }"#,
+        )
+        .unwrap();
+        let mock = MockTransport::new(SHOW);
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, reg)));
+        let _ = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        assert!(
+            mock.last.lock().unwrap().is_none(),
+            "an unknown vendor must not be probed"
+        );
+    }
+
+    #[test]
+    fn discovery_failure_degrades_to_declared() {
+        let kernel = Kernel::new(Arc::new(space(
+            Arc::new(DownTransport),
+            OpenAiConfig::ollama("llama3.2:3b"),
+        )));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["models"]["ollama"]["caps"]["cost"], "local");
+    }
+
+    #[test]
+    fn selection_reasons_over_discovered_traits() {
+        // `tools` is NOT declared — only discovery (/api/show) knows it.
+        let reg = Registry::from_json(
+            r#"{ "default": "o", "providers": { "o": {
+                "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+                "caps": { "vendor": "ollama" } } } }"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(SHOW), reg)));
+        assert_eq!(selected(&kernel, "tools"), "urn:llm:o:ask");
+    }
+
+    #[test]
+    fn annotations_fill_gaps_and_override_with_conflicts() {
+        let mut reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let conflicts = reg.apply_annotations(&[
+            // gap-fill on `remote` (no vendor declared) — full trait-graph forms
+            (
+                "urn:llm:remote:ask",
+                "https://ikigai-rs.dev/ns#vendor",
+                "openai",
+            ),
+            // override on `fast` (declared 131072) — bare forms work too
+            ("fast", "context", "32768"),
+            // modality unions in, never conflicts
+            ("fast", "ik:modality", "vision"),
+            // unknown subject: ignored
+            ("urn:llm:nobody:ask", "vendor", "acme"),
+        ]);
+        assert_eq!(
+            conflicts,
+            vec![AnnotationConflict {
+                provider: "fast".to_string(),
+                trait_name: "context".to_string(),
+                declared: "131072".to_string(),
+                annotated: "32768".to_string(),
+            }]
+        );
+        let fast = reg.providers.iter().find(|p| p.provider == "fast").unwrap();
+        assert_eq!(fast.caps.context, Some(32768), "annotation overrode");
+        assert!(fast.caps.modalities.contains(&"vision".to_string()));
+        let remote = reg
+            .providers
+            .iter()
+            .find(|p| p.provider == "remote")
+            .unwrap();
+        assert_eq!(remote.caps.vendor.as_deref(), Some("openai"), "gap filled");
     }
 
     /// A transport whose server is unreachable — every send fails.
