@@ -124,9 +124,14 @@ trait data as a queryable graph.
 
 ## Installed models & the default-model fallback
 **`urn:llm:<provider>:installed`** lists what the provider can actually serve
-right now (`GET {base}/models` — newline list, pipeable; `as=application/json`
-for an array). It's the complement of `urn:llm:models`: *configured* vs
-*installed*. Live fact — uncacheable.
+right now, **smallest-first** — a declared `vendor: "ollama"` uses the native
+`/api/tags` (which reports sizes; the `as=application/json` face carries them
+for host co-load budgeting), anything else falls back to the OpenAI-compat
+`GET {base}/models` (names only, server order). Newline list, pipeable. It's
+the complement of `urn:llm:models`: *configured* vs *installed*. Live fact —
+uncacheable. Smallest-first means "first installed" reads as "cheapest to
+run": big models are an explicit choice (`model=` / `needs=`), never an
+accident of list order.
 
 And the backend resolves defaults against it: if a request **didn't name**
 `model=` and the configured default 404s (the demo moved machines; the model

@@ -479,7 +479,7 @@ impl Endpoint for OpenAiBackend {
             let fallback = installed_models(self.transport.as_ref(), inv, &self.config)
                 .await
                 .ok()
-                .and_then(|models| models.into_iter().next());
+                .and_then(|models| models.into_iter().next().map(|m| m.model));
             if let Some(first) = fallback {
                 if first != model {
                     payload["model"] = json!(first);
@@ -1143,30 +1143,46 @@ async fn post_json(
         .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))
 }
 
-/// The models actually available at the provider right now — `GET {base}/models`
-/// (the OpenAI-compat listing), ids in server order. Net-gated like every
-/// provider call. Backs `urn:llm:<provider>:installed` and the default-model
-/// fallback.
+/// One installed model: its name and — where the provider reports it — its
+/// size in bytes, so hosts can make machine-fitness decisions (co-load budgets,
+/// smallest-first defaults).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledModel {
+    /// The model id, e.g. `llama3.2:3b`.
+    pub model: String,
+    /// Size in bytes, when the provider reports one (Ollama's `/api/tags` does;
+    /// the OpenAI-compat listing doesn't).
+    pub size: Option<u64>,
+}
+
+/// The models actually available at the provider right now, **smallest-first**
+/// where sizes are known. A declared `vendor: "ollama"` uses the native
+/// `/api/tags` (which reports sizes); anything else — or a tags failure — falls
+/// back to the OpenAI-compat `GET {base}/models` listing (names only, server
+/// order). Net-gated like every provider call. Backs
+/// `urn:llm:<provider>:installed` and the default-model fallback — so "first
+/// installed" means "cheapest to run": big models are an explicit choice
+/// (`model=` / `needs=`), never an accident of list order.
 async fn installed_models(
     transport: &dyn HttpTransport,
     inv: &Invocation<'_>,
     config: &OpenAiConfig,
-) -> Result<Vec<String>> {
+) -> Result<Vec<InstalledModel>> {
+    if config.caps.vendor.as_deref() == Some("ollama") {
+        if let Ok(mut models) = installed_via_tags(transport, inv, config).await {
+            if !models.is_empty() {
+                models.sort_by_key(|m| m.size.unwrap_or(u64::MAX));
+                return Ok(models);
+            }
+        }
+    }
     let url = require_net(
         inv,
         &config.base_url,
         "models",
         &format!("urn:llm:{}:installed", config.provider),
     )?;
-    let response = transport
-        .send(HttpRequest {
-            method: Method::Get,
-            url,
-            headers: Vec::new(),
-            body: Vec::new(),
-        })
-        .await
-        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))?;
+    let response = get(transport, url).await?;
     if response.status >= 400 {
         return Err(Error::Endpoint(format!(
             "urn:llm:{}:installed: provider returned {}",
@@ -1180,10 +1196,73 @@ async fn installed_models(
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .filter_map(|m| m["id"].as_str())
+                .map(|id| InstalledModel {
+                    model: id.to_string(),
+                    size: None,
+                })
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Ollama's native listing — names AND sizes. Only called for a declared
+/// ollama vendor (the same opt-in rule as trait discovery).
+async fn installed_via_tags(
+    transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
+    config: &OpenAiConfig,
+) -> Result<Vec<InstalledModel>> {
+    let root = config
+        .base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1");
+    let url = format!("{root}/api/tags");
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| Error::Endpoint(format!("llm: bad base_url `{}`: {e}", config.base_url)))?;
+    let host = parsed.host_str().unwrap_or("");
+    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+        return Err(Error::Endpoint(format!(
+            "urn:llm:{}:installed: capability does not allow reaching `{host}`",
+            config.provider
+        )));
+    }
+    let response = get(transport, url).await?;
+    if response.status >= 400 {
+        return Err(Error::Endpoint(format!(
+            "llm: /api/tags returned {}",
+            response.status
+        )));
+    }
+    let v: Value = serde_json::from_slice(&response.body)
+        .map_err(|e| Error::Endpoint(format!("llm: /api/tags was not JSON: {e}")))?;
+    Ok(v["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    m["name"].as_str().map(|name| InstalledModel {
+                        model: name.to_string(),
+                        size: m["size"].as_u64(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// A capability-checked-elsewhere GET, mapping transport failure to an error.
+async fn get(transport: &dyn HttpTransport, url: String) -> Result<HttpResponse> {
+    transport
+        .send(HttpRequest {
+            method: Method::Get,
+            url,
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))
 }
 
 /// `urn:llm:<provider>:installed` — what the provider can actually serve right
@@ -1210,12 +1289,17 @@ impl Endpoint for InstalledEndpoint {
             .map(|s| s.contains("json"))
             .unwrap_or(false);
         let (media, bytes) = if want_json {
+            let detail: Vec<Value> = models
+                .iter()
+                .map(|m| json!({ "model": m.model, "size": m.size }))
+                .collect();
             (
                 "application/json",
-                serde_json::to_vec(&json!(models)).unwrap_or_default(),
+                serde_json::to_vec(&detail).unwrap_or_default(),
             )
         } else {
-            ("text/plain", models.join("\n").into_bytes())
+            let names: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
+            ("text/plain", names.join("\n").into_bytes())
         };
         Ok(Representation::new(
             ReprType::new(media).with_param("charset", "utf-8"),
@@ -1842,13 +1926,14 @@ mod tests {
 
     const NOT_FOUND: &str = r#"{"error":{"message":"model "ghost" not found, try pulling it first","type":"api_error"}}"#;
     const INSTALLED: &str = r#"{"object":"list","data":[{"id":"real:latest"},{"id":"other:7b"}]}"#;
+    const TAGS: &str = r#"{"models":[{"name":"big:latest","size":23900000000},{"name":"small:3b","size":2000000000}]}"#;
 
     #[test]
     fn a_missing_default_model_falls_back_to_whats_installed() {
         // The configured default ("ghost") isn't on this machine's server — the
-        // demo-moved-hosts case. Expect: 404 -> list installed -> retry with the
-        // first installed model -> answer.
-        let mock = QueueTransport::new(vec![(404, NOT_FOUND), (200, INSTALLED), (200, CANNED)]);
+        // demo-moved-hosts case. Expect: 404 -> list installed (native tags for
+        // an ollama vendor) -> retry with the SMALLEST installed model -> answer.
+        let mock = QueueTransport::new(vec![(404, NOT_FOUND), (200, TAGS), (200, CANNED)]);
         let mut config = OpenAiConfig::ollama("ghost");
         config.provider = "o".to_string();
         let transport: Arc<dyn HttpTransport> = mock.clone();
@@ -1857,12 +1942,40 @@ mod tests {
         assert_eq!(out.bytes, b"Hello there!");
         let log = mock.log.lock().unwrap();
         assert_eq!(log.len(), 3, "chat, list, retry");
-        assert!(log[1].url.ends_with("/models"), "listed what's installed");
+        assert!(log[1].url.ends_with("/api/tags"), "listed via native tags");
         let retry = String::from_utf8_lossy(&log[2].body).to_string();
         assert!(
-            retry.contains("real:latest"),
-            "retried with the first installed: {retry}"
+            retry.contains("small:3b"),
+            "retried with the smallest installed: {retry}"
         );
+    }
+
+    #[test]
+    fn installed_is_smallest_first_with_sizes() {
+        // /api/tags lists big first; the resource orders smallest-first, and the
+        // json face carries the sizes hosts use for co-load budgeting.
+        let mock = MockTransport::new(TAGS);
+        let kernel = kernel_with(mock);
+        let out = issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").unwrap(),
+            ),
+        );
+        assert_eq!(out.bytes, b"small:3b\nbig:latest");
+        let json = issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").unwrap(),
+            )
+            .with_arg("as", ArgRef::Inline(b"application/json".to_vec())),
+        );
+        let v: Value = serde_json::from_slice(&json.bytes).unwrap();
+        assert_eq!(v[0]["model"], "small:3b");
+        assert_eq!(v[0]["size"], 2000000000u64);
+        assert_eq!(v[1]["model"], "big:latest");
     }
 
     #[test]
