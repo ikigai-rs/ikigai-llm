@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -11,7 +11,7 @@ keywords = ["ikigai", "roc", "llm", "inference", "ollama"]
 categories = ["web-programming"]
 
 [dependencies]
-ikigai-core = "0.1.32"
+ikigai-core = "0.1.48" # 0.1.48 = Invocation::trace_note (model-tier span labels)
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
 # client or executor baked into this crate.
