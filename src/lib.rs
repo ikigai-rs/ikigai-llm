@@ -449,6 +449,15 @@ impl Endpoint for OpenAiBackend {
             .map(str::to_string)
             .unwrap_or_else(|_| self.config.default_model.clone());
 
+        // Label this span with what the selection actually chose — the trace
+        // answers "on which model, at which provider/tier" by name instead of
+        // leaving it implicit in the target IRI (a free no-op untraced).
+        inv.trace_note("model", &model);
+        inv.trace_note("provider", &self.config.provider);
+        if let Some(cost) = &self.config.caps.cost {
+            inv.trace_note("cost", cost);
+        }
+
         let mut messages = Vec::new();
         if let Ok(system) = inv.inline_str("system") {
             messages.push(json!({ "role": "system", "content": system }));
@@ -1555,6 +1564,35 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn a_traced_ask_labels_model_provider_and_cost() {
+        struct Rec(Mutex<Vec<ikigai_core::TraceEvent>>);
+        impl ikigai_core::Tracer for Rec {
+            fn record(&self, event: ikigai_core::TraceEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let mock = MockTransport::new(CANNED);
+        let kernel = kernel_with(Arc::clone(&mock));
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        block_on(kernel.issue_traced(
+            ask("urn:llm:ollama:ask", "hi"),
+            &Capability::root(),
+            rec.clone(),
+        ))
+        .unwrap();
+        let events = rec.0.lock().unwrap().clone();
+        let ask_event = events
+            .iter()
+            .find(|e| e.target == "urn:llm:ollama:ask")
+            .expect("the ask span is recorded");
+        // The trace answers "on which model, at which provider/tier" by name.
+        let has = |k: &str, v: &str| ask_event.notes.contains(&(k.to_string(), v.to_string()));
+        assert!(has("model", "llama3.1"), "notes: {:?}", ask_event.notes);
+        assert!(has("provider", "ollama"));
+        assert!(has("cost", "local"));
     }
 
     #[test]
