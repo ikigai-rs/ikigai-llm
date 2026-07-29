@@ -476,10 +476,17 @@ impl Endpoint for OpenAiBackend {
         // names `model=` explicitly errors honestly — never substitute — but a
         // defaulted one resolves against what IS installed and retries once.
         if response.status == 404 && !explicit_model {
+            // Smallest CHAT-capable model — an embedder may sort first (they're
+            // tiny) but can't answer a chat request.
             let fallback = installed_models(self.transport.as_ref(), inv, &self.config)
                 .await
                 .ok()
-                .and_then(|models| models.into_iter().next().map(|m| m.model));
+                .and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|m| model_supports(m, "completion"))
+                        .map(|m| m.model)
+                });
             if let Some(first) = fallback {
                 if first != model {
                     payload["model"] = json!(first);
@@ -1153,6 +1160,17 @@ pub struct InstalledModel {
     /// Size in bytes, when the provider reports one (Ollama's `/api/tags` does;
     /// the OpenAI-compat listing doesn't).
     pub size: Option<u64>,
+    /// What the model can do (`completion`, `embedding`, `tools`, …), where the
+    /// provider reports it (Ollama's `/api/show`). Empty = unknown, and unknown
+    /// passes every `supports` check — providers that don't report capabilities
+    /// keep working.
+    pub capabilities: Vec<String>,
+}
+
+/// Whether a model can serve `what` (`completion`, `embedding`, …). Unknown
+/// capabilities pass: no facts, no policy.
+fn model_supports(m: &InstalledModel, what: &str) -> bool {
+    m.capabilities.is_empty() || m.capabilities.iter().any(|c| c == what)
 }
 
 /// The models actually available at the provider right now, **smallest-first**
@@ -1172,6 +1190,7 @@ async fn installed_models(
         if let Ok(mut models) = installed_via_tags(transport, inv, config).await {
             if !models.is_empty() {
                 models.sort_by_key(|m| m.size.unwrap_or(u64::MAX));
+                annotate_capabilities(transport, inv, config, &mut models).await;
                 return Ok(models);
             }
         }
@@ -1200,10 +1219,54 @@ async fn installed_models(
                 .map(|id| InstalledModel {
                     model: id.to_string(),
                     size: None,
+                    capabilities: Vec::new(),
                 })
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Enrich an Ollama listing with per-model capabilities via `/api/show` — the
+/// fact that separates chat models from embedders. Best-effort: any failure
+/// leaves that model's capabilities unknown (empty), which every check treats
+/// as capable.
+async fn annotate_capabilities(
+    transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
+    config: &OpenAiConfig,
+    models: &mut [InstalledModel],
+) {
+    let root = config
+        .base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1");
+    let url = format!("{root}/api/show");
+    let Ok(parsed) = url::Url::parse(&url) else {
+        return;
+    };
+    let host = parsed.host_str().unwrap_or("");
+    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+        return;
+    }
+    let headers = [("Content-Type".to_string(), "application/json".to_string())];
+    for m in models.iter_mut() {
+        let Ok(response) = post_json(transport, &url, &headers, &json!({ "model": m.model })).await
+        else {
+            continue;
+        };
+        if response.status >= 400 {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&response.body) else {
+            continue;
+        };
+        if let Some(caps) = v["capabilities"].as_array() {
+            m.capabilities = caps
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect();
+        }
+    }
 }
 
 /// Ollama's native listing — names AND sizes. Only called for a declared
@@ -1245,6 +1308,7 @@ async fn installed_via_tags(
                     m["name"].as_str().map(|name| InstalledModel {
                         model: name.to_string(),
                         size: m["size"].as_u64(),
+                        capabilities: Vec::new(),
                     })
                 })
                 .collect()
@@ -1283,7 +1347,10 @@ impl InstalledEndpoint {
 #[async_trait]
 impl Endpoint for InstalledEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let models = installed_models(self.transport.as_ref(), inv, &self.config).await?;
+        let mut models = installed_models(self.transport.as_ref(), inv, &self.config).await?;
+        if let Ok(want) = inv.inline_str("supports") {
+            models.retain(|m| model_supports(m, want));
+        }
         let want_json = inv
             .inline_str("as")
             .map(|s| s.contains("json"))
@@ -1291,7 +1358,9 @@ impl Endpoint for InstalledEndpoint {
         let (media, bytes) = if want_json {
             let detail: Vec<Value> = models
                 .iter()
-                .map(|m| json!({ "model": m.model, "size": m.size }))
+                .map(
+                    |m| json!({ "model": m.model, "size": m.size, "capabilities": m.capabilities }),
+                )
                 .collect();
             (
                 "application/json",
@@ -1323,6 +1392,14 @@ impl Endpoint for InstalledEndpoint {
             .input(
                 ArgSpec::new("as")
                     .summary("text/plain newline list (default) or application/json")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("supports")
+                    .summary(
+                        "keep only models with this capability (completion, embedding, \
+                         tools, …); models whose capabilities are unknown always pass",
+                    )
                     .optional(),
             )
             .output("text/plain;charset=utf-8")
@@ -1927,13 +2004,23 @@ mod tests {
     const NOT_FOUND: &str = r#"{"error":{"message":"model "ghost" not found, try pulling it first","type":"api_error"}}"#;
     const INSTALLED: &str = r#"{"object":"list","data":[{"id":"real:latest"},{"id":"other:7b"}]}"#;
     const TAGS: &str = r#"{"models":[{"name":"big:latest","size":23900000000},{"name":"small:3b","size":2000000000}]}"#;
+    const SHOW_EMBED: &str = r#"{"capabilities":["embedding"]}"#;
+    const SHOW_CHAT: &str = r#"{"capabilities":["completion","tools"]}"#;
 
     #[test]
     fn a_missing_default_model_falls_back_to_whats_installed() {
         // The configured default ("ghost") isn't on this machine's server — the
         // demo-moved-hosts case. Expect: 404 -> list installed (native tags for
-        // an ollama vendor) -> retry with the SMALLEST installed model -> answer.
-        let mock = QueueTransport::new(vec![(404, NOT_FOUND), (200, TAGS), (200, CANNED)]);
+        // an ollama vendor, capabilities via /api/show smallest-first) -> retry
+        // with the smallest CHAT-CAPABLE model. small:3b sorts first but is an
+        // embedder — it must be passed over, not asked to chat.
+        let mock = QueueTransport::new(vec![
+            (404, NOT_FOUND),
+            (200, TAGS),
+            (200, SHOW_EMBED), // small:3b
+            (200, SHOW_CHAT),  // big:latest
+            (200, CANNED),
+        ]);
         let mut config = OpenAiConfig::ollama("ghost");
         config.provider = "o".to_string();
         let transport: Arc<dyn HttpTransport> = mock.clone();
@@ -1941,13 +2028,49 @@ mod tests {
         let out = issue(&kernel, ask("urn:llm:o:ask", "hi"));
         assert_eq!(out.bytes, b"Hello there!");
         let log = mock.log.lock().unwrap();
-        assert_eq!(log.len(), 3, "chat, list, retry");
+        assert_eq!(log.len(), 5, "chat, list, show x2, retry");
         assert!(log[1].url.ends_with("/api/tags"), "listed via native tags");
-        let retry = String::from_utf8_lossy(&log[2].body).to_string();
+        assert!(log[2].url.ends_with("/api/show"), "capabilities probed");
+        let retry = String::from_utf8_lossy(&log[4].body).to_string();
         assert!(
-            retry.contains("small:3b"),
-            "retried with the smallest installed: {retry}"
+            retry.contains("big:latest"),
+            "retried with the smallest chat-capable model, not the embedder: {retry}"
         );
+    }
+
+    #[test]
+    fn supports_filters_out_models_that_cannot_chat() {
+        // The selection seam the jury demo rides: supports=completion drops the
+        // embedder even though it sorts first (smallest).
+        let mock = QueueTransport::new(vec![(200, TAGS), (200, SHOW_EMBED), (200, SHOW_CHAT)]);
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, OpenAiConfig::ollama("llama3.1"))));
+        let out = issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").unwrap(),
+            )
+            .with_arg("supports", ArgRef::Inline(b"completion".to_vec())),
+        );
+        assert_eq!(out.bytes, b"big:latest");
+    }
+
+    #[test]
+    fn unknown_capabilities_pass_the_supports_filter() {
+        // The OpenAI-compat listing reports no capabilities: supports= must not
+        // empty the list (no facts, no policy).
+        let mock = MockTransport::new(INSTALLED);
+        let kernel = kernel_with(mock);
+        let out = issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").unwrap(),
+            )
+            .with_arg("supports", ArgRef::Inline(b"completion".to_vec())),
+        );
+        assert_eq!(out.bytes, b"real:latest\nother:7b");
     }
 
     #[test]
@@ -1976,6 +2099,9 @@ mod tests {
         assert_eq!(v[0]["model"], "small:3b");
         assert_eq!(v[0]["size"], 2000000000u64);
         assert_eq!(v[1]["model"], "big:latest");
+        // MockTransport answers /api/show with the tags body — no capabilities
+        // key — so the json face reports unknown as an empty array.
+        assert_eq!(v[0]["capabilities"], json!([]));
     }
 
     #[test]
