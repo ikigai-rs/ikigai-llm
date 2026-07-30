@@ -35,8 +35,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// The capability every backend call requires — reaching a server, even on
-/// localhost, is a network act.
-const CAP_NET: &str = "urn:cap:net";
+/// localhost, is a network act. Declared in the **wildcard form** (the
+/// constitution's rule for parameterized ACL families): the manifold offers the
+/// action to any capability holding SOME `urn:cap:net:*` grant, and the kernel's
+/// baseline `requires` enforcement (core ≥ 0.1.49) passes it on the same
+/// predicate; `require_net` then checks the actual host against the grant — the
+/// declared floor, the per-host ceiling.
+const CAP_NET: &str = "urn:cap:net:*";
 
 /// A backend's capability profile — the traits selection reasons over. Facts
 /// arrive at three strengths: **annotations** (an alignment graph, authoritative
