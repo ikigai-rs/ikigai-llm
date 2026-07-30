@@ -400,7 +400,7 @@ impl Endpoint for AskFacade {
 
     fn describe(&self) -> Description {
         ask_description(
-            "urn:llm:ask",
+            "llm-ask",
             "Ask an LLM: route to a backend (provider=, else needs= resolved over the \
              trait profiles, else the configured default) and return the completion.",
         )
@@ -555,7 +555,7 @@ impl Endpoint for OpenAiBackend {
 
     fn describe(&self) -> Description {
         ask_description(
-            &format!("urn:llm:{}:ask", self.config.provider),
+            &format!("llm-{}-ask", self.config.provider),
             "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
         )
     }
@@ -649,7 +649,7 @@ impl Endpoint for ConfigEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:llm:config")
+        Description::new("llm-config")
             .summary(
                 "The effective LLM provider registry (default + configured backends; \
                  API keys redacted).",
@@ -784,7 +784,7 @@ impl Endpoint for ModelsEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:llm:models")
+        Description::new("llm-models")
             .summary(
                 "The annotated model inventory: every configured backend with its model \
                  and declared capability profile (context, modalities, tools, cost). \
@@ -1120,7 +1120,7 @@ impl Endpoint for SelectEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:llm:select")
+        Description::new("llm-select")
             .summary(
                 "Capability-based selection: resolve `needs` (e.g. \"vision, ctx>=32k, \
                  cost<=cheap\") over the declared trait profiles and return the winning \
@@ -1395,7 +1395,7 @@ impl Endpoint for InstalledEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new(format!("urn:llm:{}:installed", self.config.provider))
+        Description::new(format!("llm-{}-installed", self.config.provider))
             .summary(
                 "The models the provider can actually serve right now (newline list; \
                  as=application/json for an array). Live fact — uncacheable. The \
@@ -1477,7 +1477,7 @@ impl Endpoint for UpEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new(format!("urn:llm:{}:up", self.config.provider))
+        Description::new(format!("llm-{}-up", self.config.provider))
             .summary(
                 "Boolean liveness: `true` if the provider answers a cheap GET, else \
                  `false`. Branch on it with urn:fn:conditional to degrade gracefully.",
@@ -1551,6 +1551,38 @@ mod tests {
     fn ask(iri: &str, prompt: &str) -> Request {
         Request::new(Verb::Source, Iri::parse(iri).unwrap())
             .with_arg("prompt", ArgRef::Inline(prompt.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn description_ids_are_labels_not_iris() {
+        // A `Description::id` is the endpoint's LABEL — it names the
+        // implementation, while the binding IRI names the resource. Using the
+        // IRI for both made a wire listing read `urn:llm:ask → urn:llm:ask`
+        // (scoped_entries pairs endpoint-IRI with id) and produced malformed
+        // catalog skolems (`urn:ikigai:endpoint:urn:llm:ask:action:source`).
+        // The id must match `name()`, as everywhere else in the ecosystem.
+        let mock = MockTransport::new(CANNED);
+        let config = OpenAiConfig::ollama("llama3.1");
+        let facade = AskFacade::new(Registry::single(config.clone()), Arc::clone(&mock) as _);
+        let backend = OpenAiBackend::new(config.clone(), Arc::clone(&mock) as _);
+        let installed = InstalledEndpoint::new(config.clone(), Arc::clone(&mock) as _);
+        let up = UpEndpoint::new(config, Arc::clone(&mock) as _);
+
+        for (id, name) in [
+            (facade.describe().id, facade.name().to_string()),
+            (backend.describe().id, backend.name().to_string()),
+            (installed.describe().id, installed.name().to_string()),
+            (up.describe().id, up.name().to_string()),
+        ] {
+            assert!(
+                !id.starts_with("urn:"),
+                "a description id is a label, not an IRI: {id}"
+            );
+            let _ = name; // name()s are per-KIND; ids are per-BINDING (provider-qualified)
+        }
+        assert_eq!(facade.describe().id, "llm-ask");
+        assert_eq!(backend.describe().id, "llm-ollama-ask");
+        assert_eq!(installed.describe().id, "llm-ollama-installed");
     }
 
     #[test]
