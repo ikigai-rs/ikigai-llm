@@ -304,9 +304,10 @@ impl From<OpenAiConfig> for Registry {
 /// Mount the LLM facade, one backend per configured provider, and the config
 /// resource.
 ///
-/// Binds `urn:llm:ask` (the facade), a `urn:llm:<provider>:ask` for every provider
-/// in the registry (each directly addressable and catalog-advertised with its own
-/// model/base_url), and `urn:llm:config` (the effective registry, keys redacted).
+/// Binds `urn:llm:ask` (the facade), a `urn:llm:<provider>:ask` / `:up` /
+/// `:installed` / `:model` for every provider in the registry (each directly
+/// addressable and catalog-advertised with its own model/base_url), and
+/// `urn:llm:config` (the effective registry, keys redacted).
 /// Accepts a [`Registry`] or — via `From<OpenAiConfig>` — a single [`OpenAiConfig`].
 /// The host supplies the [`HttpTransport`].
 pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -> EndpointSpace {
@@ -341,6 +342,10 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
             .bind(
                 Exact::new(format!("urn:llm:{}:installed", provider.provider)),
                 InstalledEndpoint::new(provider.clone(), Arc::clone(&transport)),
+            )
+            .bind(
+                Exact::new(format!("urn:llm:{}:model", provider.provider)),
+                ModelEndpoint::new(provider.clone()),
             );
     }
     space
@@ -657,6 +662,58 @@ impl Endpoint for ConfigEndpoint {
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("application/json")
+    }
+}
+
+// ---- the model-identity resource --------------------------------------------
+
+/// `urn:llm:<provider>:model` — the provider's configured model id, verbatim,
+/// as `text/plain`. The cheap identity face: one small resolve answers "which
+/// model actually serves this provider?" for consumers that fold TRUE model
+/// identity into derived artifacts (archive version tags, provenance labels)
+/// without coupling to the whole `urn:llm:config` registry JSON. Model ids are
+/// not secrets (unlike the api keys `:config` redacts) — nothing is hidden.
+///
+/// Cacheable on the same grounds as `urn:llm:config` and `urn:llm:models`: the
+/// host loads the registry at start-up, so a config edit needs a restart (which
+/// also empties the cache) — live reload does not exist yet. If/when it lands,
+/// `:config`, `:models`, and `:model` all need the same freshness revisit (a
+/// golden-thread cut on reload): one shared fact, one shared fix.
+pub struct ModelEndpoint {
+    config: OpenAiConfig,
+}
+
+impl ModelEndpoint {
+    fn new(config: OpenAiConfig) -> Self {
+        ModelEndpoint { config }
+    }
+}
+
+#[async_trait]
+impl Endpoint for ModelEndpoint {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            self.config.default_model.clone().into_bytes(),
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "llm-model"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(format!("llm-{}-model", self.config.provider))
+            .summary(
+                "The provider's configured model id, verbatim (text/plain) — the cheap \
+                 identity face for consumers folding true model identity into derived \
+                 artifacts (archive version tags, provenance labels) without pulling \
+                 the whole urn:llm:config registry.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
     }
 }
 
@@ -1566,12 +1623,14 @@ mod tests {
         let facade = AskFacade::new(Registry::single(config.clone()), Arc::clone(&mock) as _);
         let backend = OpenAiBackend::new(config.clone(), Arc::clone(&mock) as _);
         let installed = InstalledEndpoint::new(config.clone(), Arc::clone(&mock) as _);
+        let model = ModelEndpoint::new(config.clone());
         let up = UpEndpoint::new(config, Arc::clone(&mock) as _);
 
         for (id, name) in [
             (facade.describe().id, facade.name().to_string()),
             (backend.describe().id, backend.name().to_string()),
             (installed.describe().id, installed.name().to_string()),
+            (model.describe().id, model.name().to_string()),
             (up.describe().id, up.name().to_string()),
         ] {
             assert!(
@@ -1583,6 +1642,7 @@ mod tests {
         assert_eq!(facade.describe().id, "llm-ask");
         assert_eq!(backend.describe().id, "llm-ollama-ask");
         assert_eq!(installed.describe().id, "llm-ollama-installed");
+        assert_eq!(model.describe().id, "llm-ollama-model");
     }
 
     #[test]
@@ -1729,6 +1789,8 @@ mod tests {
             "urn:llm:config",
             "urn:llm:fast:ask",
             "urn:llm:remote:ask",
+            "urn:llm:fast:model",
+            "urn:llm:remote:model",
         ] {
             assert!(patterns.iter().any(|p| p == expected), "missing {expected}");
         }
@@ -2243,6 +2305,36 @@ mod tests {
             Request::new(Verb::Source, Iri::parse("urn:llm:ollama:up").unwrap()),
         );
         assert_eq!(out.bytes, b"false");
+    }
+
+    #[test]
+    fn model_reports_the_configured_id_verbatim() {
+        // The identity face is a pure config read: it must answer with the
+        // provider's default_model EXACTLY (no trailing newline, no quoting),
+        // reach no network (DownTransport), need no net capability, and be
+        // cacheable on the same grounds as urn:llm:config (registry loads at
+        // host start; a restart is the only thing that changes it).
+        let reg = Registry::from_json(TWO_PROVIDERS).unwrap();
+        let kernel = Kernel::new(Arc::new(space(Arc::new(DownTransport), reg)));
+        let no_caps = Capability::root().attenuate(Vec::<String>::new());
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:llm:fast:model").unwrap()),
+            &no_caps,
+        ))
+        .unwrap();
+        assert_eq!(out.bytes, b"llama3.2:3b");
+        assert_eq!(out.repr_type.canonical(), "text/plain;charset=utf-8");
+        assert_eq!(
+            out.expiry,
+            ikigai_core::Expiry::Never,
+            "config-derived: cacheable like urn:llm:config"
+        );
+        let remote = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:llm:remote:model").unwrap()),
+            &no_caps,
+        ))
+        .unwrap();
+        assert_eq!(remote.bytes, b"gpt-4o");
     }
 
     #[test]

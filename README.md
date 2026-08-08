@@ -140,6 +140,16 @@ available model**. An explicit `model=` is *never* substituted — that errors
 honestly. So a host's default config degrades to "use what's here" instead of
 failing on a hardcoded name.
 
+## Model identity: `urn:llm:<provider>:model`
+The provider's configured model id, **verbatim**, as `text/plain` — e.g.
+`source urn:llm:coder:model` → `qwen3-coder:30b`. The cheap identity face for
+consumers that fold true model identity into derived artifacts (archive
+version tags, provenance labels) without pulling the whole `urn:llm:config`
+registry JSON. Model ids aren't secrets — nothing is redacted — and no network
+or capability is needed: it's a pure config read. Cacheable on the same
+grounds as `urn:llm:config`/`urn:llm:models` (the registry loads at host
+start; a restart is the only thing that changes it).
+
 ## Liveness: `urn:llm:<provider>:up`
 A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
 else `false`. Built for `urn:fn:conditional`, so demos degrade gracefully:
