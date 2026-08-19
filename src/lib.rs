@@ -46,8 +46,15 @@ const CAP_NET: &str = "urn:cap:net:*";
 /// A backend's capability profile — the traits selection reasons over. Facts
 /// arrive at three strengths: **annotations** (an alignment graph, authoritative
 /// — may override, loudly) > **declared** (config-authored) > **discovered**
-/// (Ollama's `/api/show`, fills gaps only).
-#[derive(Clone, Debug, Default, Deserialize)]
+/// (Ollama's `/api/show` and an OpenAI-compat `/v1/models` listing, fills gaps
+/// only).
+///
+/// **Two kinds of fact live here and they are sourced differently.** `context`,
+/// `modalities`, `tools` and `json` are *capability* — the server is the best
+/// witness, and a hand-written value that survives a model swap silently
+/// misroutes work (`urn:llm:select` ROUTES on them). `cost` and `vendor` are
+/// *governance* — never discovered, only declared; see [`listing_caps`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Caps {
     /// Context window, in tokens.
     #[serde(default)]
@@ -85,8 +92,10 @@ pub struct OpenAiConfig {
     /// Base URL up to (not including) `/chat/completions`,
     /// e.g. `"http://localhost:11434/v1"`.
     pub base_url: String,
-    /// Model used when a request doesn't name one.
-    pub default_model: String,
+    /// Model used when a request doesn't name one — or **`None`**, meaning this
+    /// provider names the **server**, not the model: the model is discovered
+    /// from the backend on each resolve (see [`OpenAiConfig::discovering`]).
+    pub default_model: Option<String>,
     /// Bearer token, if the endpoint needs one. Local runtimes usually don't.
     pub api_key: Option<String>,
     /// The declared capability profile (what `urn:llm:models` reports and
@@ -100,13 +109,27 @@ impl OpenAiConfig {
         OpenAiConfig {
             provider: "ollama".to_string(),
             base_url: "http://localhost:11434/v1".to_string(),
-            default_model: default_model.into(),
+            default_model: Some(default_model.into()),
             api_key: None,
             caps: Caps {
                 cost: Some("local".to_string()),
                 vendor: Some("ollama".to_string()),
                 ..Caps::default()
             },
+        }
+    }
+
+    /// A provider that names the **server**, not the model: whatever that server
+    /// is serving right now answers, and a model swap behind it needs no config
+    /// edit and no host restart. `caps` still carries the **declared** governance
+    /// (`cost`, `vendor`) — those are never taken from the server's self-report.
+    pub fn discovering(provider: impl Into<String>, base_url: impl Into<String>) -> Self {
+        OpenAiConfig {
+            provider: provider.into(),
+            base_url: base_url.into(),
+            default_model: None,
+            api_key: None,
+            caps: Caps::default(),
         }
     }
 }
@@ -137,15 +160,23 @@ impl Registry {
     /// { "default": "fast",
     ///   "providers": {
     ///     "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
+    ///     "server": { "base_url": "http://localhost:8000/v1",
+    ///                 "caps": { "cost": "local", "vendor": "mlx" } },
     ///     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
     ///   } }
     /// ```
+    ///
+    /// **`model` is optional.** An entry that omits it names the *server*: the
+    /// model is discovered from the backend per resolve, so swapping the model
+    /// behind a server needs no config edit and no restart (the registry is read
+    /// once at kernel construction — there is no watcher). Declared `caps` still
+    /// win over anything the server says about itself.
     pub fn from_json(json: &str) -> Result<Self> {
         #[derive(Deserialize)]
         struct Entry {
             base_url: String,
-            #[serde(alias = "default_model")]
-            model: String,
+            #[serde(default, alias = "default_model")]
+            model: Option<String>,
             #[serde(default)]
             api_key: Option<String>,
             #[serde(default)]
@@ -345,7 +376,7 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
             )
             .bind(
                 Exact::new(format!("urn:llm:{}:model", provider.provider)),
-                ModelEndpoint::new(provider.clone()),
+                ModelEndpoint::new(provider.clone(), Arc::clone(&transport)),
             );
     }
     space
@@ -454,10 +485,22 @@ impl Endpoint for OpenAiBackend {
             .inline_str("prompt")
             .or_else(|_| inv.inline_str("content"))
             .map_err(|_| Error::MissingArgument("prompt".to_string()))?;
-        let model = inv
-            .inline_str("model")
-            .map(str::to_string)
-            .unwrap_or_else(|_| self.config.default_model.clone());
+        // `model=` wins verbatim — always, for a discovering provider too: the
+        // caller named a model, and naming one is never a request to go looking.
+        // Otherwise: the configured id, else whatever the server serves now.
+        let model = match inv.inline_str("model") {
+            Ok(named) => named.to_string(),
+            Err(_) => {
+                resolve_model(
+                    self.transport.as_ref(),
+                    inv,
+                    &self.config,
+                    &format!("urn:llm:{}:ask", self.config.provider),
+                )
+                .await?
+                .0
+            }
+        };
 
         // Label this span with what the selection actually chose — the trace
         // answers "on which model, at which provider/tier" by name instead of
@@ -636,6 +679,9 @@ impl Endpoint for ConfigEndpoint {
                 p.provider.clone(),
                 json!({
                     "base_url": p.base_url,
+                    // `null` for a provider that names the server: nothing is
+                    // configured. This resource reports the REGISTRY, so it
+                    // stays a pure config read — it never probes.
                     "model": p.default_model,
                     "api_key": p.api_key.as_ref().map(|_| "***"),
                 }),
@@ -674,29 +720,62 @@ impl Endpoint for ConfigEndpoint {
 /// without coupling to the whole `urn:llm:config` registry JSON. Model ids are
 /// not secrets (unlike the api keys `:config` redacts) — nothing is hidden.
 ///
-/// Cacheable on the same grounds as `urn:llm:config` and `urn:llm:models`: the
-/// host loads the registry at start-up, so a config edit needs a restart (which
-/// also empties the cache) — live reload does not exist yet. If/when it lands,
-/// `:config`, `:models`, and `:model` all need the same freshness revisit (a
-/// golden-thread cut on reload): one shared fact, one shared fix.
+/// **Two cost contracts, chosen by the provider's own config** — the resource is
+/// the same, the provider decides what it costs:
+///
+/// * A provider that **pinned a model** answers from config: no network, no
+///   capability, permanently cacheable, on the same grounds as `urn:llm:config`
+///   and `urn:llm:models` (the host loads the registry at start-up, so a config
+///   edit needs a restart, which also empties the cache — live reload does not
+///   exist yet; if it lands, `:config`, `:models`, and `:model` all need the
+///   same golden-thread cut).
+/// * A provider that **names only the server** has no configured id to report,
+///   so the discovered id is the only honest answer: it probes the backend
+///   (`urn:cap:net:*`, declared) and is **uncacheable** — caching it would
+///   reintroduce exactly the staleness discovery removes, and a cached
+///   representation cannot be invalidated across a mount.
+///
+/// For [`ikigai-browse`]'s explain archive — which keys version tags on this
+/// resource — that is the semantics it already asks for: the four pinned
+/// providers keep their exact id (no archive re-derivation), and a discovering
+/// provider re-keys when the model behind the server actually changes, which is
+/// the stated feature ("a model swap re-keys the archive without any
+/// browse-side config").
+///
+/// [`ikigai-browse`]: https://github.com/ikigai-rs/ikigai-browse
 pub struct ModelEndpoint {
     config: OpenAiConfig,
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl ModelEndpoint {
-    fn new(config: OpenAiConfig) -> Self {
-        ModelEndpoint { config }
+    fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
+        ModelEndpoint { config, transport }
     }
 }
 
 #[async_trait]
 impl Endpoint for ModelEndpoint {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
-        Ok(Representation::new(
-            ReprType::new("text/plain").with_param("charset", "utf-8"),
-            self.config.default_model.clone().into_bytes(),
-        )
-        .cacheable())
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        fn plain(model: String) -> Representation {
+            Representation::new(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                model.into_bytes(),
+            )
+        }
+        match &self.config.default_model {
+            Some(model) => Ok(plain(model.clone()).cacheable()),
+            None => {
+                let (model, _) = resolve_model(
+                    self.transport.as_ref(),
+                    inv,
+                    &self.config,
+                    &format!("urn:llm:{}:model", self.config.provider),
+                )
+                .await?;
+                Ok(plain(model)) // live fact: uncacheable
+            }
+        }
     }
 
     fn name(&self) -> &str {
@@ -704,16 +783,29 @@ impl Endpoint for ModelEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new(format!("llm-{}-model", self.config.provider))
-            .summary(
+        let description = Description::new(format!("llm-{}-model", self.config.provider))
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8");
+        // Declared = enforced: only the discovering form touches the network, so
+        // only it declares the net capability (declaring it on the config read
+        // would make the manifold over-offer).
+        if self.config.default_model.is_some() {
+            description.summary(
                 "The provider's configured model id, verbatim (text/plain) — the cheap \
                  identity face for consumers folding true model identity into derived \
                  artifacts (archive version tags, provenance labels) without pulling \
-                 the whole urn:llm:config registry.",
+                 the whole urn:llm:config registry. No network; cacheable.",
             )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .output("text/plain;charset=utf-8")
+        } else {
+            description
+                .summary(
+                    "The model this provider's SERVER is serving right now (text/plain) \
+                     — this provider pinned no model, so the discovered id is the only \
+                     honest identity. Probes the backend; uncacheable.",
+                )
+                .requires(CAP_NET)
+        }
     }
 }
 
@@ -768,10 +860,12 @@ impl ModelsEndpoint {
     fn as_turtle(registry: &Registry) -> String {
         let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
         for p in &registry.providers {
-            let mut props = vec![
-                "a ik:LlmBackend".to_string(),
-                format!("ik:model {}", ttl_str(&p.default_model)),
-            ];
+            let mut props = vec!["a ik:LlmBackend".to_string()];
+            // Absent when a discovering provider's backend could not be reached:
+            // the inventory still lists it, rather than failing the whole graph.
+            if let Some(model) = &p.default_model {
+                props.push(format!("ik:model {}", ttl_str(model)));
+            }
             if let Some(c) = p.caps.context {
                 props.push(format!("ik:context {c}"));
             }
@@ -830,10 +924,10 @@ impl Endpoint for ModelsEndpoint {
                 serde_json::to_vec(&Self::as_json(&effective)).unwrap_or_default(),
             )
         };
-        Ok(
-            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes)
-                .cacheable(),
-        )
+        Ok(with_cacheability(
+            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes),
+            &self.registry,
+        ))
     }
 
     fn name(&self) -> &str {
@@ -885,7 +979,11 @@ async fn discovered_caps(
     if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
         return None; // no capability -> no discovery; declared profile stands
     }
-    let body = serde_json::to_vec(&json!({ "model": provider.default_model })).ok()?;
+    // Needs a model to ask ABOUT. `effective_registry` resolves a discovering
+    // provider's model first, so by here it is known — unless the backend was
+    // unreachable, in which case there is nothing to show.
+    let model = provider.default_model.as_deref()?;
+    let body = serde_json::to_vec(&json!({ "model": model })).ok()?;
     let response = transport
         .send(HttpRequest {
             method: Method::Post,
@@ -950,11 +1048,45 @@ async fn effective_registry(
 ) -> Registry {
     let mut effective = registry.clone();
     for provider in &mut effective.providers {
+        // A provider that named only the SERVER: ask the server what it serves.
+        // The same round trip carries that model's advertised capability facts,
+        // so discovery costs one request, not two. Deliberately GRACEFUL here —
+        // an unreachable backend leaves this entry's model unresolved and the
+        // inventory still describes every other provider. `:ask` and `:model`
+        // are where an unreachable backend fails loudly, and they must.
+        if provider.default_model.is_none() {
+            if let Ok((model, advertised)) =
+                resolve_model(transport.as_ref(), inv, provider, "urn:llm:models").await
+            {
+                provider.default_model = Some(model);
+                if let Some(found) = advertised {
+                    provider.caps = merge_declared_wins(&provider.caps, found);
+                }
+            }
+        }
         if let Some(found) = discovered_caps(transport.as_ref(), inv, provider).await {
             provider.caps = merge_declared_wins(&provider.caps, found);
         }
     }
     effective
+}
+
+/// Does any provider name only its server? Then this invocation had to ask the
+/// network what the answer is, and the result is a **live fact** — cacheing it
+/// would restore exactly the staleness discovery exists to remove (and a cached
+/// representation reached through a mount can never be invalidated at all).
+/// A registry of pinned providers is unaffected: config in, cacheable out.
+fn any_discovering(registry: &Registry) -> bool {
+    registry.providers.iter().any(|p| p.default_model.is_none())
+}
+
+/// Mark a config-derived representation cacheable — unless discovery fed it.
+fn with_cacheability(repr: Representation, registry: &Registry) -> Representation {
+    if any_discovering(registry) {
+        repr
+    } else {
+        repr.cacheable()
+    }
 }
 
 // ---- capability-based selection -------------------------------------------------
@@ -1166,10 +1298,10 @@ impl Endpoint for SelectEndpoint {
                 format!("urn:llm:{}:ask", winner.provider).into_bytes(),
             )
         };
-        Ok(
-            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes)
-                .cacheable(),
-        )
+        Ok(with_cacheability(
+            Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes),
+            &self.registry,
+        ))
     }
 
     fn name(&self) -> &str {
@@ -1235,7 +1367,104 @@ pub struct InstalledModel {
     /// provider reports it (Ollama's `/api/show`). Empty = unknown, and unknown
     /// passes every `supports` check — providers that don't report capabilities
     /// keep working.
+    ///
+    /// **Ollama's vocabulary only.** An OpenAI-compat listing may carry a
+    /// `capabilities` array too, but it is a DIFFERENT vocabulary (rapid-mlx
+    /// answers `["text","tools"]` — modality plus tools, no `completion` term),
+    /// and folding it in here would make every such model fail
+    /// `supports=completion` and vanish from the very list discovery reads.
+    /// Those facts go to [`InstalledModel::advertised`] instead.
     pub capabilities: Vec<String>,
+    /// Capability facts the listing advertised **about this model** — context
+    /// window, modalities, tool support — where the server reports them
+    /// (rapid-mlx's `/v1/models` does; Ollama's `/api/tags` and the plain
+    /// OpenAI-compat listing don't). Never carries `cost` or `vendor`: those
+    /// are governance, and a server is not a trustworthy witness about itself.
+    pub advertised: Option<Caps>,
+}
+
+/// The capability facts an OpenAI-compat listing entry advertises about its
+/// model — `context_window`, `modality`, and a `capabilities` array (rapid-mlx
+/// serves all three). `None` when the entry says nothing beyond its id.
+///
+/// **`cost` and `vendor` are structurally absent here, and that is the point.**
+/// They are governance, not capability: `vendor` is the axis a `needs=`
+/// exclusion works on (`vendor!=openai`), and a provider that declared no
+/// vendor cannot pass an exclusion *because it might be that vendor*. A server
+/// that self-reports `owned_by: "rapid-mlx"` must not be able to launder itself
+/// past a policy by saying so — so the discovered profile has no field to put
+/// it in, rather than a precedence rule that could later be reordered.
+fn listing_caps(entry: &Value) -> Option<Caps> {
+    let mut caps = Caps::default();
+    let mut found = false;
+    if let Some(context) = entry["context_window"].as_u64() {
+        caps.context = Some(context);
+        found = true;
+    }
+    if let Some(modality) = entry["modality"].as_str() {
+        caps.modalities.push(modality.to_string());
+        found = true;
+    }
+    if let Some(list) = entry["capabilities"].as_array() {
+        let has = |name: &str| list.iter().any(|c| c.as_str() == Some(name));
+        caps.tools = Some(has("tools"));
+        // The array mixes tool support with modality names; take the modalities
+        // it names and leave the rest (an unknown term is not a fact we model).
+        for modality in ["text", "vision", "audio"] {
+            if has(modality) && !caps.modalities.iter().any(|m| m == modality) {
+                caps.modalities.push(modality.to_string());
+            }
+        }
+        found = true;
+    }
+    found.then_some(caps)
+}
+
+/// The model a provider serves, and what the server says about it: the
+/// **configured** id when the provider pinned one (no network — a pinned
+/// provider costs exactly what it did before), else the model the backend is
+/// serving **right now**.
+///
+/// Discovery reuses the one ordering rule the crate already has —
+/// [`installed_models`] is smallest-first and `supports=completion`-filtered —
+/// so a big model stays an explicit choice (`model=` / `needs=`) and never an
+/// accident of list order. More than one model served is a legitimate state,
+/// not an error: the ordering rule resolves it (rapid-mlx lists its canonical
+/// id and a lowercase alias for the same weights today, so erroring would break
+/// a live server for no gain). Pin a `model` to say which one you meant.
+///
+/// Failure names the `base_url` and stops. There is deliberately **no
+/// cross-provider fallback**: silently answering from a different backend would
+/// defeat every governance term a caller expressed.
+async fn resolve_model(
+    transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
+    config: &OpenAiConfig,
+    who: &str,
+) -> Result<(String, Option<Caps>)> {
+    if let Some(model) = &config.default_model {
+        return Ok((model.clone(), None));
+    }
+    let models = installed_models(transport, inv, config)
+        .await
+        .map_err(|e| {
+            Error::Endpoint(format!(
+                "{who}: could not discover a model at `{}` — this provider declares no \
+                 `model`, and listing the server's models failed: {e}",
+                config.base_url
+            ))
+        })?;
+    models
+        .into_iter()
+        .find(|m| model_supports(m, "completion"))
+        .map(|m| (m.model, m.advertised))
+        .ok_or_else(|| {
+            Error::Endpoint(format!(
+                "{who}: could not discover a model at `{}` — this provider declares no \
+                 `model`, and the server listed no chat-capable model",
+                config.base_url
+            ))
+        })
 }
 
 /// Whether a model can serve `what` (`completion`, `embedding`, …). Unknown
@@ -1286,11 +1515,12 @@ async fn installed_models(
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| m["id"].as_str())
-                .map(|id| InstalledModel {
+                .filter_map(|m| m["id"].as_str().map(|id| (id, m)))
+                .map(|(id, entry)| InstalledModel {
                     model: id.to_string(),
                     size: None,
                     capabilities: Vec::new(),
+                    advertised: listing_caps(entry),
                 })
                 .collect()
         })
@@ -1380,6 +1610,9 @@ async fn installed_via_tags(
                         model: name.to_string(),
                         size: m["size"].as_u64(),
                         capabilities: Vec::new(),
+                        // Ollama's tags listing carries no capability facts;
+                        // `/api/show` fills them via `discovered_caps`.
+                        advertised: None,
                     })
                 })
                 .collect()
@@ -1623,7 +1856,7 @@ mod tests {
         let facade = AskFacade::new(Registry::single(config.clone()), Arc::clone(&mock) as _);
         let backend = OpenAiBackend::new(config.clone(), Arc::clone(&mock) as _);
         let installed = InstalledEndpoint::new(config.clone(), Arc::clone(&mock) as _);
-        let model = ModelEndpoint::new(config.clone());
+        let model = ModelEndpoint::new(config.clone(), Arc::clone(&mock) as _);
         let up = UpEndpoint::new(config, Arc::clone(&mock) as _);
 
         for (id, name) in [
@@ -1771,7 +2004,7 @@ mod tests {
             .iter()
             .find(|p| p.provider == "remote")
             .unwrap();
-        assert_eq!(remote.default_model, "gpt-4o");
+        assert_eq!(remote.default_model.as_deref(), Some("gpt-4o"));
         assert_eq!(remote.api_key.as_deref(), Some("sk-SECRET"));
     }
 
@@ -2335,6 +2568,274 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(remote.bytes, b"gpt-4o");
+    }
+
+    // ---- a provider names the SERVER, the server names the model ------------
+
+    /// What Brian's `rapid-mlx` really answers on `GET /v1/models` (trimmed to
+    /// the fields we read). Note TWO entries for ONE set of weights — the
+    /// canonical id and a lowercase alias — so "more than one model served" is
+    /// the live case, not a hypothetical.
+    const RAPID_MODELS: &str = r#"{"object":"list","data":[
+        {"id":"mlx-community/Qwen3.8-27B-4bit","object":"model","owned_by":"rapid-mlx",
+         "modality":"text","context_window":262144,"capabilities":["text","tools"]},
+        {"id":"qwen3.8-27b-4bit","object":"model","owned_by":"rapid-mlx",
+         "modality":"text","context_window":262144,"capabilities":["text","tools"]}]}"#;
+
+    const CANONICAL: &str = "mlx-community/Qwen3.8-27B-4bit";
+
+    /// A provider that pins nothing: `{ "base_url": … }`, governance only.
+    const DISCOVERING: &str = r#"{ "default": "rapid", "providers": { "rapid": {
+        "base_url": "http://localhost:8000/v1" } } }"#;
+
+    fn registry_of(json: &str) -> Registry {
+        Registry::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn from_json_accepts_an_entry_that_names_only_the_server() {
+        let reg = registry_of(DISCOVERING);
+        let rapid = reg
+            .providers
+            .iter()
+            .find(|p| p.provider == "rapid")
+            .unwrap();
+        assert_eq!(rapid.default_model, None, "no model pinned");
+        // ...and one that DOES pin a model still parses it verbatim.
+        let pinned = registry_of(TWO_PROVIDERS);
+        assert_eq!(
+            pinned.providers[0].default_model.as_deref(),
+            Some("llama3.2:3b")
+        );
+    }
+
+    #[test]
+    fn an_unpinned_provider_discovers_its_model_and_answers() {
+        // GET the listing, then chat with what came back. Two models are served
+        // (canonical + alias); the ordering rule resolves it rather than erroring.
+        let mock = QueueTransport::new(vec![(200, RAPID_MODELS), (200, CANNED)]);
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, registry_of(DISCOVERING))));
+        let out = issue(&kernel, ask("urn:llm:rapid:ask", "hi"));
+        assert_eq!(out.bytes, b"Hello there!");
+
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.len(), 2, "one probe, one chat");
+        assert_eq!(log[0].method, Method::Get);
+        assert_eq!(log[0].url, "http://localhost:8000/v1/models");
+        let body: Value = serde_json::from_slice(&log[1].body).unwrap();
+        assert_eq!(body["model"], CANONICAL, "the discovered id, not a guess");
+    }
+
+    #[test]
+    fn discovery_fills_capability_but_declared_values_win() {
+        // The provider declares governance AND a context it wants to keep.
+        let reg = registry_of(
+            r#"{ "default": "rapid", "providers": { "rapid": {
+                "base_url": "http://localhost:8000/v1",
+                "caps": { "cost": "local", "vendor": "mlx", "context": 4096 } } } }"#,
+        );
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(RAPID_MODELS), reg)));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        let entry = &v["models"]["rapid"];
+        assert_eq!(entry["model"], CANONICAL, "the model is discovered");
+        assert_eq!(
+            entry["caps"]["tools"], true,
+            "tools discovered from listing"
+        );
+        assert_eq!(
+            entry["caps"]["modalities"][0], "text",
+            "modality discovered"
+        );
+        assert_eq!(
+            entry["caps"]["context"], 4096,
+            "a DECLARED context wins over the server's 262144"
+        );
+        assert_eq!(entry["caps"]["vendor"], "mlx", "declared vendor stands");
+        assert_eq!(entry["caps"]["cost"], "local", "declared cost stands");
+    }
+
+    #[test]
+    fn a_server_cannot_launder_itself_past_a_governance_exclusion() {
+        // rapid-mlx self-reports `owned_by: "rapid-mlx"`, and the provider
+        // declared no vendor. Governance is NOT discoverable: vendor stays
+        // unstated, so `vendor!=openai` still fails it (it might BE openai).
+        let kernel = Kernel::new(Arc::new(space(
+            MockTransport::new(RAPID_MODELS),
+            registry_of(DISCOVERING),
+        )));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["models"]["rapid"]["caps"]["vendor"], Value::Null);
+        assert_eq!(v["models"]["rapid"]["caps"]["cost"], Value::Null);
+        // ...while the capability it DID advertise is there to route on.
+        assert_eq!(v["models"]["rapid"]["caps"]["context"], 262144);
+
+        let laundered = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(b"vendor!=openai".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(
+            laundered.is_err(),
+            "a self-reported owner must not satisfy a vendor exclusion"
+        );
+    }
+
+    #[test]
+    fn an_explicit_model_beats_discovery_and_probes_nothing() {
+        // Naming a model is never a request to go looking for one.
+        let mock = QueueTransport::new(vec![(200, CANNED)]);
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, registry_of(DISCOVERING))));
+        let out = issue(
+            &kernel,
+            ask("urn:llm:rapid:ask", "hi").with_arg("model", ArgRef::Inline(b"named:7b".to_vec())),
+        );
+        assert_eq!(out.bytes, b"Hello there!");
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "no probe: the caller named the model");
+        let body: Value = serde_json::from_slice(&log[0].body).unwrap();
+        assert_eq!(body["model"], "named:7b");
+    }
+
+    #[test]
+    fn a_down_backend_names_the_base_url_and_substitutes_nothing() {
+        let kernel = Kernel::new(Arc::new(space(
+            Arc::new(DownTransport),
+            registry_of(DISCOVERING),
+        )));
+        for iri in ["urn:llm:rapid:ask", "urn:llm:rapid:model"] {
+            let failed = block_on(kernel.issue(ask(iri, "hi"), &Capability::root()));
+            let msg = format!("{:?}", failed.unwrap_err());
+            assert!(msg.contains("could not discover a model"), "{msg}");
+            assert!(
+                msg.contains("http://localhost:8000/v1"),
+                "the error names the base_url: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_keeps_the_smallest_chat_capable_first_rule() {
+        // An unpinned provider pointed at Ollama: native tags list big first,
+        // the ordering rule sorts smallest-first, and the embedder that sorts
+        // ahead of everything is passed over — the same rule the 404 fallback
+        // uses, not a second one.
+        let mock = QueueTransport::new(vec![
+            (200, TAGS),
+            (200, SHOW_EMBED), // small:3b
+            (200, SHOW_CHAT),  // big:latest
+            (200, CANNED),
+        ]);
+        let reg = registry_of(
+            r#"{ "default": "any", "providers": { "any": {
+                "base_url": "http://localhost:11434/v1",
+                "caps": { "vendor": "ollama", "cost": "local" } } } }"#,
+        );
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let kernel = Kernel::new(Arc::new(space(transport, reg)));
+        let out = issue(&kernel, ask("urn:llm:any:ask", "hi"));
+        assert_eq!(out.bytes, b"Hello there!");
+        let log = mock.log.lock().unwrap();
+        let chat: Value = serde_json::from_slice(&log[3].body).unwrap();
+        assert_eq!(chat["model"], "big:latest", "the embedder cannot chat");
+    }
+
+    #[test]
+    fn the_identity_face_answers_from_config_or_from_the_server() {
+        // PINNED: no network (DownTransport), no capability, permanently
+        // cacheable, byte-identical to before. browse keys explain-archive
+        // version tags on this — a changed id re-derives every explanation.
+        let pinned = Kernel::new(Arc::new(space(
+            Arc::new(DownTransport),
+            registry_of(TWO_PROVIDERS),
+        )));
+        let no_caps = Capability::root().attenuate(Vec::<String>::new());
+        let out = block_on(pinned.issue(
+            Request::new(Verb::Source, Iri::parse("urn:llm:fast:model").unwrap()),
+            &no_caps,
+        ))
+        .unwrap();
+        assert_eq!(out.bytes, b"llama3.2:3b");
+        assert_eq!(out.expiry, ikigai_core::Expiry::Never);
+
+        // DISCOVERING: the discovered id is the only honest answer, it costs a
+        // probe, and it is a LIVE fact — cacheing it would restore the staleness
+        // discovery exists to remove.
+        let mock = MockTransport::new(RAPID_MODELS);
+        let discovering = Kernel::new(Arc::new(space(mock, registry_of(DISCOVERING))));
+        let live = issue(
+            &discovering,
+            Request::new(Verb::Source, Iri::parse("urn:llm:rapid:model").unwrap()),
+        );
+        assert_eq!(String::from_utf8(live.bytes).unwrap(), CANONICAL);
+        assert_eq!(live.expiry, ikigai_core::Expiry::Always, "uncacheable");
+
+        // ...and it is capability-gated, because it reaches the network.
+        let denied = block_on(discovering.issue(
+            Request::new(Verb::Source, Iri::parse("urn:llm:rapid:model").unwrap()),
+            &no_caps,
+        ));
+        assert!(denied.is_err(), "a probing :model needs urn:cap:net");
+    }
+
+    #[test]
+    fn only_the_probing_identity_face_declares_the_net_capability() {
+        // Declared = enforced, both directions: the config read must not
+        // over-offer, the probe must not under-declare.
+        let mock = MockTransport::new(CANNED);
+        let pinned = ModelEndpoint::new(OpenAiConfig::ollama("llama3.1"), Arc::clone(&mock) as _);
+        let discovering = ModelEndpoint::new(
+            OpenAiConfig::discovering("rapid", "http://localhost:8000/v1"),
+            Arc::clone(&mock) as _,
+        );
+        assert!(!pinned.describe().requires.iter().any(|c| c == CAP_NET));
+        assert!(discovering.describe().requires.iter().any(|c| c == CAP_NET));
+    }
+
+    #[test]
+    fn config_derived_resources_stay_cacheable_for_pinned_registries() {
+        // The four pinned providers must pay nothing for this feature: a
+        // registry with no discovering provider caches exactly as before.
+        let pinned = Kernel::new(Arc::new(space(
+            MockTransport::new(CANNED),
+            registry_of(SELECTABLE),
+        )));
+        for (iri, arg) in [("urn:llm:models", None), ("urn:llm:select", Some("vision"))] {
+            let mut req = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+            if let Some(needs) = arg {
+                req = req.with_arg("needs", ArgRef::Inline(needs.as_bytes().to_vec()));
+            }
+            assert_eq!(
+                issue(&pinned, req).expiry,
+                ikigai_core::Expiry::Never,
+                "{iri} is config-derived here"
+            );
+        }
+        // One discovering provider makes the inventory a live fact.
+        let live = Kernel::new(Arc::new(space(
+            MockTransport::new(RAPID_MODELS),
+            registry_of(DISCOVERING),
+        )));
+        assert_eq!(
+            issue(
+                &live,
+                Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap())
+            )
+            .expiry,
+            ikigai_core::Expiry::Always,
+            "discovery must not be cached"
+        );
     }
 
     #[test]

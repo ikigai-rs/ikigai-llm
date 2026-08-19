@@ -52,10 +52,31 @@ load-time form of "the logical config aliases to file-or-code"):
                 "caps": { "context": 131072, "modalities": ["text"], "tools": true,
                           "cost": "local", "params": "3B" } },
     "big":    { "base_url": "http://localhost:11434/v1", "model": "llama3.1:70b" },
+    "rapid":  { "base_url": "http://localhost:8000/v1",
+                "caps": { "cost": "local", "vendor": "mlx" } },
     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
   }
 }
 ```
+
+### `model` is optional: name the server, not the model
+An entry that **omits `model`** (like `rapid` above) names the **server**. The
+model is discovered from the backend per resolve, so swapping the model behind
+that server — a different `rapid-mlx` checkpoint, a freshly pulled Ollama tag —
+takes effect on the next `ask`: no config edit, no host restart. That matters
+because the registry is read **once at kernel construction**; there is no
+watcher, so a pinned `model` costs a bounce of every host that read the file,
+and the name lies in between.
+
+Discovery reuses one existing rule rather than adding a second: the
+smallest **chat-capable** model the server lists (see *Installed models* below),
+so a big model stays an explicit choice. Several models served is a legitimate
+state resolved by that rule, not an error — `rapid-mlx` lists its canonical id
+*and* a lowercase alias for the same weights. Pin a `model` to say which.
+
+Failure is loud and local: an unreachable backend errors with
+`could not discover a model at <base_url>`, and **never** silently answers from
+a different provider.
 
 ```rust
 let registry = ikigai_llm::Registry::from_json(&std::fs::read_to_string(path)?)?;
@@ -68,7 +89,17 @@ let space = ikigai_llm::space(Arc::new(my_transport), registry);
 ## Capability profiles & `urn:llm:models`
 Each provider may declare a **`caps`** profile — `context` (tokens), `modalities`
 (`["text","vision"]`), `tools`, `json`, `cost` (`local`|`cheap`|`premium`),
-`params` (`"3B"`) — the traits selection will reason over. **`urn:llm:models`**
+`params` (`"3B"`) — the traits selection will reason over.
+
+**Two kinds of fact live in `caps`, sourced differently.** `context`,
+`modalities` and `tools` are *capability*: for a provider that names only the
+server they are read from that server's listing, because a hand-written value
+that survives a model swap silently misroutes work (`urn:llm:select` **routes**
+on them). `cost` and `vendor` are *governance*: never discovered, only
+declared. A server that self-reports `owned_by: "rapid-mlx"` must not be able
+to launder itself past `vendor!=openai` by saying so — so the discovered
+profile has no field to put it in, and a provider that declared no vendor still
+fails the exclusion. Declared values always win; discovery fills only gaps. **`urn:llm:models`**
 is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 **queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
 `ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor`), so "a vision model with
@@ -141,14 +172,32 @@ honestly. So a host's default config degrades to "use what's here" instead of
 failing on a hardcoded name.
 
 ## Model identity: `urn:llm:<provider>:model`
-The provider's configured model id, **verbatim**, as `text/plain` — e.g.
+The model id serving this provider, as `text/plain` — e.g.
 `source urn:llm:coder:model` → `qwen3-coder:30b`. The cheap identity face for
 consumers that fold true model identity into derived artifacts (archive
 version tags, provenance labels) without pulling the whole `urn:llm:config`
-registry JSON. Model ids aren't secrets — nothing is redacted — and no network
-or capability is needed: it's a pure config read. Cacheable on the same
-grounds as `urn:llm:config`/`urn:llm:models` (the registry loads at host
-start; a restart is the only thing that changes it).
+registry JSON. Model ids aren't secrets — nothing is redacted.
+
+**The provider's own config picks the cost contract**, so a consumer's cost is
+whatever its providers chose:
+
+| provider | answer | network | capability | cacheable |
+| --- | --- | --- | --- | --- |
+| pins a `model` | that id, **verbatim** | none | none | yes (`Never`) |
+| names the server | the id the server serves **now** | one `GET {base}/models` | `urn:cap:net:*` | **no** |
+
+A pinned provider is a pure config read, exactly as before — that matters
+because `ikigai-browse` keys explain-archive version tags on this resource, and
+a changed id silently re-derives every archived explanation. A discovering
+provider has no configured default, so the discovered id is the only honest
+answer, and it re-keys the archive exactly when the model behind the server
+really changes — which is the behaviour browse already documents as a feature.
+It is uncacheable on purpose: caching a discovered id restores the staleness
+discovery exists to remove, and a cached representation reached through a mount
+can never be invalidated.
+
+The same rule governs `urn:llm:models` and `urn:llm:select`: cacheable while
+every provider is pinned, uncacheable once any provider discovers.
 
 ## Liveness: `urn:llm:<provider>:up`
 A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
