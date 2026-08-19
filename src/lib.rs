@@ -49,11 +49,23 @@ const CAP_NET: &str = "urn:cap:net:*";
 /// (Ollama's `/api/show` and an OpenAI-compat `/v1/models` listing, fills gaps
 /// only).
 ///
-/// **Two kinds of fact live here and they are sourced differently.** `context`,
-/// `modalities`, `tools` and `json` are *capability* — the server is the best
-/// witness, and a hand-written value that survives a model swap silently
-/// misroutes work (`urn:llm:select` ROUTES on them). `cost` and `vendor` are
-/// *governance* — never discovered, only declared; see [`listing_caps`].
+/// **Two axes cut this set, and they are not the same axis.**
+///
+/// * *Use* — selection **routes** on `context`, `modalities`, `tools`, `json`,
+///   `cost`, `vendor` and `batch_at`: a wrong value misroutes work. Only
+///   `params` is display.
+/// * *Provenance* — who is a trustworthy witness. `context`, `modalities`,
+///   `tools` and `json` are the SERVER's to know (a hand-written value that
+///   survives a model swap silently misroutes work), so discovery fills gaps
+///   from Ollama's `/api/show` and an OpenAI-compat `/v1/models` listing.
+///   `cost`, `vendor` and `batch_at` are **declared-only** — never discovered,
+///   because they are exactly the axes a policy excludes on and a server that
+///   self-reports past a policy has laundered itself; see [`listing_caps`].
+///
+/// This crate long called the second group *governance* as though that meant
+/// "not routed on". It never did — `vendor!=openai` routes. The word names the
+/// **provenance**, not the use, and `batch_at` (a routing trait no endpoint on
+/// earth advertises) is what forced the distinction into the open.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Caps {
     /// Context window, in tokens.
@@ -80,6 +92,33 @@ pub struct Caps {
     /// Display-only parameter count, e.g. `"3B"`, `"70B"`.
     #[serde(default)]
     pub params: Option<String>,
+    /// **Load shape** — the number of concurrent in-flight requests at or above
+    /// which this backend is the throughput winner. A continuous-batching server
+    /// declares the width at which its batching starts paying; a serializing
+    /// backend declares nothing.
+    ///
+    /// A *routing* trait — the axis on which local backends most differ, and one
+    /// no caller can express by naming a model. Measured on plasma 2026-08-18,
+    /// same model (Qwen3 27B) either side, aggregate tok/s: at one request
+    /// Ollama 53.0 against a batching MLX server's 28.9; at three, 35.7 against
+    /// 46.7; at ten the batching server finished the work in 17.9s against
+    /// 49.3s. A fan-out that lands on the serializing backend costs ~3× the wall
+    /// clock; a single ask that lands on the batching one costs ~1.8×.
+    ///
+    /// **Declared-only, and deliberately without a default.** No
+    /// OpenAI-compatible endpoint advertises whether it batches — `/v1/models`
+    /// has no field for it and `/api/show` never mentions it — so there is
+    /// nothing to discover and nothing to correct a wrong guess with. The
+    /// crossover above landed at 2, but that is one machine, one model, one
+    /// prompt length and one quantization pair (an 18.2GB Ollama blob against
+    /// ~15GB resident MLX weights — not byte-identical). It is a *measurement*,
+    /// not a constant of nature, so the operator declares it per provider in
+    /// `llm.json` the way `cost` and `vendor` are declared. A provider that
+    /// declared none is **unknown**, and unknown satisfies no `batchAt<=`
+    /// requirement — the `vendor` rule exactly: a backend that never claimed to
+    /// batch must not be handed a fan-out on the strength of its silence.
+    #[serde(default, rename = "batchAt", alias = "batch_at")]
+    pub batch_at: Option<u32>,
 }
 
 /// Configuration for an OpenAI-compatible chat backend. One shape covers Ollama,
@@ -189,7 +228,7 @@ impl Registry {
         }
         let doc: Doc = serde_json::from_str(json)
             .map_err(|e| Error::Endpoint(format!("urn:llm:config: invalid JSON: {e}")))?;
-        let providers = doc
+        let providers: Vec<OpenAiConfig> = doc
             .providers
             .into_iter()
             .map(|(name, e)| OpenAiConfig {
@@ -200,6 +239,19 @@ impl Registry {
                 caps: e.caps,
             })
             .collect();
+        // A declared load shape is a concurrency, so 0 is not a small value —
+        // it is a nonsense one, and `batchAt: 0` would silently match every
+        // fan-out width. Fail the whole config rather than route on it. (A
+        // non-numeric value never reaches here: serde rejects it above, which
+        // is the same loudness by a different door.)
+        if let Some(bad) = providers.iter().find(|p| p.caps.batch_at == Some(0)) {
+            return Err(Error::Endpoint(format!(
+                "urn:llm:config: provider `{}` declares `batchAt: 0` — the batching \
+                 threshold is a number of concurrent requests, so the smallest \
+                 meaningful value is 1",
+                bad.provider
+            )));
+        }
         Ok(Registry {
             default: doc.default,
             providers,
@@ -307,6 +359,26 @@ impl Registry {
                             }
                         }
                         *field = Some(b);
+                    }
+                }
+                // The declared-only load shape. An annotation graph is
+                // operator-authored, which is exactly the provenance this trait
+                // requires — so it may set and correct it, where a server may not.
+                "batchAt" | "batch_at" => {
+                    if let Ok(n) = object.parse::<u32>() {
+                        if n >= 1 {
+                            if let Some(old) = provider.caps.batch_at {
+                                if old != n {
+                                    conflicts.push(AnnotationConflict {
+                                        provider: provider.provider.clone(),
+                                        trait_name: "batchAt".to_string(),
+                                        declared: old.to_string(),
+                                        annotated: object,
+                                    });
+                                }
+                            }
+                            provider.caps.batch_at = Some(n);
+                        }
                     }
                 }
                 // Additive: modalities are a set, an assertion joins it.
@@ -447,7 +519,10 @@ impl Endpoint for AskFacade {
         )
         .input(
             ArgSpec::new("needs")
-                .summary("capability requirements, e.g. \"vision, ctx>=32k, cost<=cheap\"")
+                .summary(
+                    "capability requirements, e.g. \"vision, ctx>=32k, cost<=cheap\" or \
+                     \"batchAt<=10\" when fanning out 10 ways",
+                )
                 .optional(),
         )
     }
@@ -847,6 +922,7 @@ impl ModelsEndpoint {
                         "cost": caps.cost,
                         "vendor": caps.vendor,
                         "params": caps.params,
+                        "batchAt": caps.batch_at,
                     },
                 }),
             );
@@ -856,7 +932,8 @@ impl ModelsEndpoint {
 
     /// The trait graph. Vocabulary is module-local for now (`ik:LlmBackend`,
     /// `ik:model`, `ik:context`, `ik:modality`, `ik:tools`, `ik:jsonMode`,
-    /// `ik:cost`, `ik:params`) — promotion into ikigai-vocab is a follow-up.
+    /// `ik:cost`, `ik:params`, `ik:batchAt`) — promotion into ikigai-vocab is a
+    /// follow-up.
     fn as_turtle(registry: &Registry) -> String {
         let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
         for p in &registry.providers {
@@ -886,6 +963,9 @@ impl ModelsEndpoint {
             }
             if let Some(pr) = &p.caps.params {
                 props.push(format!("ik:params {}", ttl_str(pr)));
+            }
+            if let Some(b) = p.caps.batch_at {
+                props.push(format!("ik:batchAt {b}"));
             }
             ttl.push_str(&format!(
                 "\n<urn:llm:{}:ask> {} .\n",
@@ -1035,6 +1115,11 @@ fn merge_declared_wins(declared: &Caps, discovered: Caps) -> Caps {
         cost: declared.cost.clone().or(discovered.cost),
         vendor: declared.vendor.clone().or(discovered.vendor),
         params: declared.params.clone().or(discovered.params),
+        // NOT `.or(discovered.batch_at)`, and structurally so: nothing
+        // discovers a load shape (no listing advertises it), and a server that
+        // could assert its own scheduling advantage could talk its way into
+        // every fan-out. Declared or unknown — there is no third source.
+        batch_at: declared.batch_at,
     }
 }
 
@@ -1115,6 +1200,12 @@ enum Need {
     ProviderIs(String),
     /// `provider!=posh` — any registry entry but this one.
     ProviderNot(String),
+    /// `batchAt<=10` — *"I am fanning out 10 ways"*: the backend's declared
+    /// batching threshold must be at or below that width, i.e. at this width the
+    /// backend is inside its throughput regime. It reads the way `cost<=cheap`
+    /// does — an upper bound on the DECLARED value — and an undeclared threshold
+    /// fails it, because silence is not a claim to batch.
+    BatchAtMost(u32),
 }
 
 /// The cost-tier ordering selection reasons over.
@@ -1162,6 +1253,16 @@ fn parse_needs(expr: &str) -> Result<Vec<Need>> {
             match k.trim() {
                 "cost" => Need::CostAtMost(
                     cost_rank(v.trim()).ok_or_else(|| bad(term, "expected local|cheap|premium"))?,
+                ),
+                // The operating point, not a capacity: the number on the right
+                // is the caller's own fan-out width, and the bound is on the
+                // provider's declared crossover.
+                "batchAt" | "batch_at" => Need::BatchAtMost(
+                    v.trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| bad(term, "expected a concurrency of 1 or more"))?,
                 ),
                 other => return Err(bad(term, &format!("`{other}` does not support <="))),
             }
@@ -1214,6 +1315,7 @@ fn satisfies(provider: &OpenAiConfig, needs: &[Need]) -> bool {
         Need::VendorNot(v) => caps.vendor.as_deref().is_some_and(|x| x != v),
         Need::ProviderIs(n) => provider.provider == *n,
         Need::ProviderNot(n) => provider.provider != *n,
+        Need::BatchAtMost(n) => caps.batch_at.is_some_and(|b| b <= *n),
     })
 }
 
@@ -1287,6 +1389,7 @@ impl Endpoint for SelectEndpoint {
                 "cost": winner.caps.cost,
                 "vendor": winner.caps.vendor,
                 "context": winner.caps.context,
+                "batchAt": winner.caps.batch_at,
             });
             (
                 "application/json",
@@ -1321,7 +1424,9 @@ impl Endpoint for SelectEndpoint {
             .input(ArgSpec::new("needs").summary(
                 "comma-separated requirements: ctx>=N[k] · cost<=tier · cost=tier · \
                  modality=X (or bare text/vision/audio) · tools · json · vendor=X · \
-                 vendor!=X (governance: e.g. no openai) · provider=name · provider!=name",
+                 vendor!=X (governance: e.g. no openai) · provider=name · provider!=name · \
+                 batchAt<=N (load shape: N is YOUR fan-out width, and only a backend \
+                 whose declared batching threshold is at or below it qualifies)",
             ))
             .input(
                 ArgSpec::new("as")
@@ -2163,6 +2268,240 @@ mod tests {
             ),
         );
         assert!(none.is_err(), "undeclared vendor must fail the exclusion");
+    }
+
+    // ---- load shape (`batchAt`) --------------------------------------------
+
+    /// Two local backends serving the same model, differing only in LOAD SHAPE.
+    /// `ollama` serializes and declares nothing; `rapid` batches and declares the
+    /// operator's measured crossover. `ollama` sorts FIRST in the registry (the
+    /// map is a BTreeMap) and ties `rapid` on cost and context — so it wins every
+    /// tie-break, and any selection that lands on `rapid` did so because the
+    /// load-shape filter excluded `ollama`, not because of ordering luck.
+    /// (Its declared vendor is `mock`, not `ollama`: a real `ollama` declaration
+    /// is the opt-in to live `/api/show` discovery, which this test has no use
+    /// for.)
+    const FANOUT: &str = r#"{
+        "default": "ollama",
+        "providers": {
+            "ollama": { "base_url": "http://localhost:11434/v1", "model": "qwen3:27b",
+                        "caps": { "context": 32768, "modalities": ["text"], "cost": "local", "vendor": "mock" } },
+            "rapid":  { "base_url": "http://localhost:8000/v1", "model": "qwen3-27b-mlx",
+                        "caps": { "context": 32768, "modalities": ["text"], "cost": "local", "vendor": "mlx",
+                                  "batchAt": 2 } }
+        }
+    }"#;
+
+    /// Byte-for-byte `FANOUT` minus the `batchAt` declaration — the control for
+    /// "additive and default-inert".
+    const FANOUT_UNDECLARED: &str = r#"{
+        "default": "ollama",
+        "providers": {
+            "ollama": { "base_url": "http://localhost:11434/v1", "model": "qwen3:27b",
+                        "caps": { "context": 32768, "modalities": ["text"], "cost": "local", "vendor": "mock" } },
+            "rapid":  { "base_url": "http://localhost:8000/v1", "model": "qwen3-27b-mlx",
+                        "caps": { "context": 32768, "modalities": ["text"], "cost": "local", "vendor": "mlx" } }
+        }
+    }"#;
+
+    fn kernel_for(json: &str) -> Kernel {
+        let reg = Registry::from_json(json).unwrap();
+        Kernel::new(Arc::new(space(MockTransport::new(CANNED), reg)))
+    }
+
+    fn select_fails(kernel: &Kernel, needs: &str) -> String {
+        let out = block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                    .with_arg("needs", ArgRef::Inline(needs.as_bytes().to_vec())),
+                &Capability::root(),
+            ),
+        );
+        format!("{:?}", out.expect_err("expected no match"))
+    }
+
+    #[test]
+    fn a_fanout_selects_the_backend_that_declared_it_batches() {
+        let kernel = kernel_for(FANOUT);
+        // Fanning out 10 ways: rapid's declared crossover (2) is at or below 10.
+        assert_eq!(selected(&kernel, "batchAt<=10"), "urn:llm:rapid:ask");
+        // At exactly the declared crossover it still qualifies (at-or-above).
+        assert_eq!(selected(&kernel, "batchAt<=2"), "urn:llm:rapid:ask");
+        // Composes with the existing grammar rather than replacing it.
+        assert_eq!(
+            selected(&kernel, "batchAt<=10, ctx>=32k, cost=local"),
+            "urn:llm:rapid:ask"
+        );
+        // Below the declared crossover NOTHING qualifies — rapid did not claim
+        // an advantage at width 1, and ollama claimed nothing at all. The caller
+        // gets a loud no-match, not a silent single-request regression.
+        let msg = select_fails(&kernel, "batchAt<=1");
+        assert!(msg.contains("no configured backend satisfies"), "{msg}");
+    }
+
+    #[test]
+    fn an_undeclared_load_shape_cannot_satisfy_a_fanout() {
+        // Neither provider declares one: silence is not a claim to batch, so the
+        // requirement fails rather than falling through to the registry's first
+        // entry (the `vendor!=` precedent).
+        let kernel = kernel_for(FANOUT_UNDECLARED);
+        let msg = select_fails(&kernel, "batchAt<=10");
+        assert!(msg.contains("no configured backend satisfies"), "{msg}");
+        assert!(msg.contains("ollama"), "names what was available: {msg}");
+    }
+
+    #[test]
+    fn declaring_a_load_shape_changes_nothing_that_did_not_ask_for_it() {
+        // The two registries differ ONLY in the `batchAt` key. Every needs=
+        // expression that predates it must resolve identically, and the facade's
+        // default route must be untouched.
+        let (with, without) = (kernel_for(FANOUT), kernel_for(FANOUT_UNDECLARED));
+        for needs in [
+            "cost=local",
+            "ctx>=32k",
+            "cost<=cheap",
+            "vendor!=openai",
+            "text, cost=local",
+            "provider!=rapid",
+        ] {
+            let (a, b) = (selected(&with, needs), selected(&without, needs));
+            assert_eq!(a, b, "`{needs}` must route the same either way");
+        }
+        // ...and the pre-existing tie-break still puts the undeclared backend
+        // first, which is what makes the tests above meaningful.
+        assert_eq!(selected(&with, "cost=local"), "urn:llm:ollama:ask");
+    }
+
+    #[test]
+    fn the_inventory_reports_the_declared_load_shape() {
+        let kernel = kernel_for(FANOUT);
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["models"]["rapid"]["caps"]["batchAt"], 2);
+        assert!(
+            v["models"]["ollama"]["caps"]["batchAt"].is_null(),
+            "an undeclared load shape reports as null, not as a number"
+        );
+
+        let ttl = String::from_utf8(
+            issue(
+                &kernel,
+                Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap())
+                    .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec())),
+            )
+            .bytes,
+        )
+        .unwrap();
+        assert!(ttl.contains("ik:batchAt 2"), "{ttl}");
+        assert_eq!(
+            ttl.matches("ik:batchAt").count(),
+            1,
+            "only rapid declared it"
+        );
+
+        // The selection detail carries it too, so a caller can see WHY it won.
+        let detail = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:select").unwrap())
+                .with_arg("needs", ArgRef::Inline(b"batchAt<=10".to_vec()))
+                .with_arg("as", ArgRef::Inline(b"application/json".to_vec())),
+        );
+        let v: Value = serde_json::from_slice(&detail.bytes).unwrap();
+        assert_eq!(v["backend"], "urn:llm:rapid:ask");
+        assert_eq!(v["batchAt"], 2);
+    }
+
+    #[test]
+    fn a_malformed_load_shape_fails_loudly() {
+        // Wrong TYPE: serde rejects the document (the config never loads at all,
+        // rather than the trait quietly defaulting to absent).
+        let wrong_type = Registry::from_json(
+            r#"{ "default": "a", "providers": { "a": {
+                 "base_url": "http://x/v1", "model": "m", "caps": { "batchAt": "lots" } } } }"#,
+        );
+        assert!(wrong_type.is_err(), "a non-numeric batchAt must not load");
+        // Negative is the same door.
+        assert!(Registry::from_json(
+            r#"{ "default": "a", "providers": { "a": {
+                 "base_url": "http://x/v1", "model": "m", "caps": { "batchAt": -1 } } } }"#
+        )
+        .is_err());
+        // NONSENSE value: 0 parses as a number but is not a concurrency, and it
+        // would match every possible fan-out width. Named, not defaulted.
+        let zero = Registry::from_json(
+            r#"{ "default": "a", "providers": { "a": {
+                 "base_url": "http://x/v1", "model": "m", "caps": { "batchAt": 0 } } } }"#,
+        );
+        let msg = format!("{:?}", zero.expect_err("batchAt: 0 must not load"));
+        assert!(msg.contains("provider `a`"), "names the provider: {msg}");
+        assert!(msg.contains("smallest"), "{msg}");
+
+        // And on the query side: a mistyped requirement errors rather than
+        // mis-selecting. `>=` is the wrong direction for an operating point.
+        let kernel = kernel_for(FANOUT);
+        for bad in ["batchAt<=0", "batchAt<=some", "batchAt>=10", "batchAt=2"] {
+            let msg = select_fails(&kernel, bad);
+            assert!(
+                !msg.contains("no configured backend satisfies"),
+                "`{bad}` must be a GRAMMAR error, not a no-match: {msg}"
+            );
+        }
+        // The snake_case spelling is accepted, so a shell-typed term works.
+        assert_eq!(selected(&kernel, "batch_at<=10"), "urn:llm:rapid:ask");
+    }
+
+    #[test]
+    fn a_server_cannot_advertise_its_own_load_shape() {
+        // A discovering provider whose listing tries to assert `batchAt` — the
+        // same laundering `vendor` is protected from. There is no field for it
+        // in the discovered profile, and the merge never reads one.
+        let listing = r#"{"data":[{"id":"m","context_window":4096,"batchAt":1}]}"#;
+        let reg = Registry::from_json(
+            r#"{ "default": "s", "providers": { "s": { "base_url": "http://localhost:8000/v1" } } }"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(Arc::new(space(MockTransport::new(listing), reg)));
+        let out = issue(
+            &kernel,
+            Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap()),
+        );
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        // The listing's genuine capability fact WAS discovered...
+        assert_eq!(v["models"]["s"]["caps"]["context"], 4096);
+        // ...and its self-asserted load shape was not.
+        assert!(v["models"]["s"]["caps"]["batchAt"].is_null());
+    }
+
+    #[test]
+    fn an_annotation_may_declare_a_load_shape() {
+        // Annotations are operator-authored, which is the provenance this trait
+        // requires — so unlike a server, the alignment graph may set and correct
+        // it, and an override is reported rather than silent.
+        let mut reg = Registry::from_json(FANOUT).unwrap();
+        let conflicts = reg.apply_annotations(&[
+            ("urn:llm:ollama:ask", "ik:batchAt", "8"),
+            ("rapid", "https://ikigai-rs.dev/ns#batchAt", "3"),
+        ]);
+        let by = |name: &str| {
+            reg.providers
+                .iter()
+                .find(|p| p.provider == name)
+                .unwrap()
+                .caps
+                .batch_at
+        };
+        assert_eq!(by("ollama"), Some(8), "filled a gap");
+        assert_eq!(by("rapid"), Some(3), "overrode the declared 2");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "the override is reported: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].trait_name, "batchAt");
+        assert_eq!(conflicts[0].declared, "2");
     }
 
     #[test]

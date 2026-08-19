@@ -89,21 +89,28 @@ let space = ikigai_llm::space(Arc::new(my_transport), registry);
 ## Capability profiles & `urn:llm:models`
 Each provider may declare a **`caps`** profile — `context` (tokens), `modalities`
 (`["text","vision"]`), `tools`, `json`, `cost` (`local`|`cheap`|`premium`),
-`params` (`"3B"`) — the traits selection will reason over.
+`batchAt` (load shape, see below), `params` (`"3B"`) — the traits selection
+reasons over.
 
-**Two kinds of fact live in `caps`, sourced differently.** `context`,
-`modalities` and `tools` are *capability*: for a provider that names only the
-server they are read from that server's listing, because a hand-written value
-that survives a model swap silently misroutes work (`urn:llm:select` **routes**
-on them). `cost` and `vendor` are *governance*: never discovered, only
-declared. A server that self-reports `owned_by: "rapid-mlx"` must not be able
-to launder itself past `vendor!=openai` by saying so — so the discovered
-profile has no field to put it in, and a provider that declared no vendor still
-fails the exclusion. Declared values always win; discovery fills only gaps. **`urn:llm:models`**
+**Two axes cut `caps`, and they are not the same axis.** *Use*: selection
+**routes** on `context`, `modalities`, `tools`, `json`, `cost`, `vendor` and
+`batchAt` — a wrong value misroutes work; only `params` is display.
+*Provenance*: who is a trustworthy witness. `context`, `modalities` and `tools`
+are the **server's** to know — for a provider that names only the server they
+are read from that server's listing, because a hand-written value that survives
+a model swap silently misroutes work. `cost`, `vendor` and `batchAt` are
+**declared-only**: never discovered, because they are exactly the axes a policy
+excludes on. A server that self-reports `owned_by: "rapid-mlx"` must not be able
+to launder itself past `vendor!=openai` by saying so — so the discovered profile
+has no field to put it in, and a provider that declared no vendor still fails the
+exclusion. (This README used to call that group *governance* as if it meant "not
+routed on"; it never did. The word names the provenance, not the use.)
+
+Declared values always win; discovery fills only gaps. **`urn:llm:models`**
 is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 **queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
-`ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor`), so "a vision model with
-≥32k context" becomes a SPARQL query over a resource.
+`ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor` · `ik:batchAt`), so "a
+vision model with ≥32k context" becomes a SPARQL query over a resource.
 
 Trait facts arrive at three strengths — **annotations > declared > discovered**:
 
@@ -134,10 +141,11 @@ source urn:llm:ask needs="ctx>=100k" prompt="…"                 -> asks the wi
 
 Grammar (comma-separated): `ctx>=N` (or `Nk` = ×1024) · `cost<=tier` / `cost=tier`
 (`local` < `cheap` < `premium`) · `modality=x` or bare `text`/`vision`/`audio` ·
-`tools` · `json` · **`vendor=x` / `vendor!=x`** (the governance axis — a provider
-declares its `vendor` in caps, e.g. `ollama`/`openai`/`anthropic`, and
-`vendor!=openai` means *this prompt never goes to OpenAI*) · `provider=name` /
-`provider!=name` (registry entries by your local names).
+`tools` · `json` · **`vendor=x` / `vendor!=x`** (a provider declares its `vendor`
+in caps, e.g. `ollama`/`openai`/`anthropic`, and `vendor!=openai` means *this
+prompt never goes to OpenAI*) · `provider=name` / `provider!=name` (registry
+entries by your local names) · **`batchAt<=N`** (load shape — see the next
+section).
 
 Unknown terms **error** (a typo must not mis-select); a trait a provider didn't
 declare can't satisfy a requirement on it — **including `vendor!=`**: an
@@ -152,6 +160,54 @@ source urn:llm:ask needs="ctx>=32k, vendor!=openai" prompt="…"   # governance-
 Selection is deterministic plain code over the registry — the SPARQL power path
 is *composition*, not a dependency: `urn:llm:models as=text/turtle` is the same
 trait data as a queryable graph.
+
+## Load shape: `batchAt` and fanning out
+Local backends differ most on an axis no trait expressed until now:
+**throughput versus latency**. Measured on one machine, same model (Qwen3 27B)
+either side, aggregate tok/s:
+
+| concurrent | 1 | 2 | 3 | 8 | 10 |
+|---|---|---|---|---|---|
+| a batching server (continuous batching) | 28.9 | 40.1 | **46.7** | **79.8** | **65.9** |
+| a serializing server | **53.0** | 41.0 | 35.7 | 42.1 | 40.5 |
+
+One request: the serializing backend is ~1.8× better. Ten: the batching one
+finishes the work in 17.9s against 49.3s. Without a trait for it, a caller that
+knows it is fanning out has no way to say so — it names a provider, and bakes one
+machine's topology into its call site.
+
+`batchAt: N` declares **the concurrency at or above which this backend is the
+throughput winner** — the operator's own measured crossover, in requests:
+
+```json
+"rapid": { "base_url": "http://localhost:8000/v1",
+           "caps": { "cost": "local", "vendor": "mlx", "batchAt": 2 } }
+```
+
+A caller then states its **operating point**, not a provider:
+
+```text
+source urn:llm:select needs="batchAt<=10"          -> the backend that batches
+source urn:llm:ask needs="batchAt<=10" prompt="…"  # one leg of a 10-way fan-out
+```
+
+`batchAt<=10` reads exactly the way `cost<=cheap` does — an upper bound on the
+*declared* value — and means "my fan-out is 10 wide; the backend's crossover must
+be at or below that."
+
+**There is no default, deliberately.** The crossover above landed at 2, but that
+is one machine, one model, one prompt length and one quantization pair; it is a
+measurement, not a constant, and nothing in the wire protocol can correct a wrong
+guess — no OpenAI-compatible endpoint advertises whether it batches. So:
+
+- an **undeclared** provider is *unknown*, and unknown satisfies no `batchAt<=`
+  requirement (the `vendor!=` rule: silence is not a claim to batch);
+- a **server** cannot assert one — the discovered profile has no field for it;
+- an **annotation graph** can (`ik:batchAt`), because it is operator-authored;
+- `batchAt: 0` and a non-numeric value **fail the config load**, naming the
+  provider, rather than defaulting to absent.
+
+Omitting the term routes exactly as it did before the trait existed.
 
 ## Installed models & the default-model fallback
 **`urn:llm:<provider>:installed`** lists what the provider can actually serve
