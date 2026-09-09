@@ -60,7 +60,7 @@ const CAP_NET: &str = "urn:cap:net:*";
 ///   from Ollama's `/api/show` and an OpenAI-compat `/v1/models` listing.
 ///   `cost`, `vendor` and `batch_at` are **declared-only** — never discovered,
 ///   because they are exactly the axes a policy excludes on and a server that
-///   self-reports past a policy has laundered itself; see [`listing_caps`].
+///   self-reports past a policy has laundered itself; see the private `listing_caps`.
 ///
 /// This crate long called the second group *governance* as though that meant
 /// "not routed on". It never did — `vendor!=openai` routes. The word names the
