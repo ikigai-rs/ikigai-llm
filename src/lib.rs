@@ -43,6 +43,25 @@ use serde_json::{json, Value};
 /// declared floor, the per-host ceiling.
 const CAP_NET: &str = "urn:cap:net:*";
 
+/// The golden thread every **config-derived** cacheable representation depends
+/// on — `urn:llm:config` itself, `urn:llm:models`, `urn:llm:select`, and a
+/// pinned provider's `urn:llm:<provider>:model`. The registry is read once at
+/// kernel construction, so today nothing cuts it and a restart is the only
+/// reload; naming the thread is what makes those results cuttable at all. A
+/// host that grows live reload cuts ONE thread (`Kernel::cut("urn:llm:config")`,
+/// or `urn:kernel:cut`) and every derived representation recomputes — including
+/// a copy cached on the far side of a mount, which an empty thread set would
+/// have served forever.
+const CONFIG_THREAD: &str = "urn:llm:config";
+
+/// The XSD datatypes the inputs declare. A prompt, a model id, a provider name
+/// and a `needs=` expression are strings (`needs` has a grammar of its own,
+/// stated in its summary — `ArgSpec` has no spelling for one); a temperature is
+/// a double; a token budget is a positive integer.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
+const XSD_POSITIVE_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#positiveInteger";
+
 /// A backend's capability profile — the traits selection reasons over. Facts
 /// arrive at three strengths: **annotations** (an alignment graph, authoritative
 /// — may override, loudly) > **declared** (config-authored) > **discovered**
@@ -515,6 +534,7 @@ impl Endpoint for AskFacade {
         .input(
             ArgSpec::new("provider")
                 .summary("backend to route to, e.g. ollama (default: configured)")
+                .class(XSD_STRING)
                 .optional(),
         )
         .input(
@@ -523,6 +543,7 @@ impl Endpoint for AskFacade {
                     "capability requirements, e.g. \"vision, ctx>=32k, cost<=cheap\" or \
                      \"batchAt<=10\" when fanning out 10 ways",
                 )
+                .class(XSD_STRING)
                 .optional(),
         )
     }
@@ -633,10 +654,10 @@ impl Endpoint for OpenAiBackend {
         }
 
         if response.status >= 400 {
-            let detail = String::from_utf8_lossy(&response.body);
             return Err(Error::Endpoint(format!(
-                "llm backend returned {}: {detail}",
-                response.status
+                "llm backend returned {}: {}",
+                response.status,
+                error_detail(&response.body)
             )));
         }
 
@@ -684,6 +705,23 @@ impl Endpoint for OpenAiBackend {
     }
 }
 
+/// What an error response contributes to our error text: the `error.message`
+/// of an OpenAI-shaped body (the one field that shape defines as the human
+/// reason), else the body verbatim. An error travels through traces, logs and
+/// MCP replies, so the structured case carries the reason and nothing else of
+/// what the server chose to echo; an unstructured body has no field to prefer.
+fn error_detail(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+}
+
 /// `Ok(v)` when `s` parses as an `f64`, else a throwaway error (so callers use
 /// `.and_then(parse_f64)` and ignore unparseable values).
 fn parse_f64(s: &str) -> Result<f64> {
@@ -705,29 +743,45 @@ fn ask_description(id: &str, summary: &str) -> Description {
     Description::new(id)
         .summary(summary)
         .verb(Verb::Source)
-        .input(ArgSpec::new("prompt").summary("the user prompt (or pipe it in as content)"))
+        .input(
+            ArgSpec::new("prompt")
+                .summary("the user prompt (or pipe it in as content)")
+                .class(XSD_STRING),
+        )
         .input(
             ArgSpec::new("model")
                 .summary("model name (default: the backend's)")
+                .class(XSD_STRING)
                 .optional(),
         )
-        .input(ArgSpec::new("system").summary("system prompt").optional())
+        .input(
+            ArgSpec::new("system")
+                .summary("system prompt")
+                .class(XSD_STRING)
+                .optional(),
+        )
         .input(
             ArgSpec::new("temperature")
                 .summary("sampling temperature")
+                .class(XSD_DOUBLE)
                 .optional(),
         )
         .input(
             ArgSpec::new("max_tokens")
                 .summary("maximum tokens to generate")
+                .class(XSD_POSITIVE_INTEGER)
                 .optional(),
         )
         .input(
             ArgSpec::new("as")
                 .summary("application/json for a {text,model,usage} envelope; default text/plain")
+                .class(XSD_STRING)
+                .one_of(["text/plain", "application/json"])
+                .default_value("text/plain")
                 .optional(),
         )
         .output("text/plain;charset=utf-8")
+        .output("application/json;charset=utf-8")
         .requires(CAP_NET)
 }
 
@@ -767,7 +821,8 @@ impl Endpoint for ConfigEndpoint {
             ReprType::new("application/json").with_param("charset", "utf-8"),
             serde_json::to_vec(&out).unwrap_or_default(),
         )
-        .cacheable())
+        .cacheable()
+        .depends_on(CONFIG_THREAD))
     }
 
     fn name(&self) -> &str {
@@ -839,7 +894,7 @@ impl Endpoint for ModelEndpoint {
             )
         }
         match &self.config.default_model {
-            Some(model) => Ok(plain(model.clone()).cacheable()),
+            Some(model) => Ok(plain(model.clone()).cacheable().depends_on(CONFIG_THREAD)),
             None => {
                 let (model, _) = resolve_model(
                     self.transport.as_ref(),
@@ -1026,9 +1081,13 @@ impl Endpoint for ModelsEndpoint {
             .input(
                 ArgSpec::new("as")
                     .summary("output representation: application/json (default) or text/turtle")
+                    .class(XSD_STRING)
+                    .one_of(["application/json", "text/turtle"])
+                    .default_value("application/json")
                     .optional(),
             )
-            .output("application/json")
+            .output("application/json;charset=utf-8")
+            .output("text/turtle;charset=utf-8")
     }
 }
 
@@ -1165,12 +1224,13 @@ fn any_discovering(registry: &Registry) -> bool {
     registry.providers.iter().any(|p| p.default_model.is_none())
 }
 
-/// Mark a config-derived representation cacheable — unless discovery fed it.
+/// Mark a config-derived representation cacheable, under the registry's thread
+/// — unless discovery fed it.
 fn with_cacheability(repr: Representation, registry: &Registry) -> Representation {
     if any_discovering(registry) {
         repr
     } else {
-        repr.cacheable()
+        repr.cacheable().depends_on(CONFIG_THREAD)
     }
 }
 
@@ -1421,19 +1481,28 @@ impl Endpoint for SelectEndpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .input(ArgSpec::new("needs").summary(
-                "comma-separated requirements: ctx>=N[k] · cost<=tier · cost=tier · \
-                 modality=X (or bare text/vision/audio) · tools · json · vendor=X · \
-                 vendor!=X (governance: e.g. no openai) · provider=name · provider!=name · \
-                 batchAt<=N (load shape: N is YOUR fan-out width, and only a backend \
-                 whose declared batching threshold is at or below it qualifies)",
-            ))
+            .input(
+                ArgSpec::new("needs")
+                    .summary(
+                        "comma-separated requirements: ctx>=N[k] · cost<=tier · cost=tier · \
+                         modality=X (or bare text/vision/audio) · tools · json · vendor=X · \
+                         vendor!=X (governance: e.g. no openai) · provider=name · \
+                         provider!=name · batchAt<=N (load shape: N is YOUR fan-out width, \
+                         and only a backend whose declared batching threshold is at or \
+                         below it qualifies)",
+                    )
+                    .class(XSD_STRING),
+            )
             .input(
                 ArgSpec::new("as")
                     .summary("text/plain backend IRI (default) or application/json detail")
+                    .class(XSD_STRING)
+                    .one_of(["text/plain", "application/json"])
+                    .default_value("text/plain")
                     .optional(),
             )
             .output("text/plain;charset=utf-8")
+            .output("application/json;charset=utf-8")
     }
 }
 
@@ -1552,12 +1621,17 @@ async fn resolve_model(
     }
     let models = installed_models(transport, inv, config)
         .await
-        .map_err(|e| {
-            Error::Endpoint(format!(
+        .map_err(|e| match e {
+            // A capability refusal keeps its type: "you may not reach this
+            // host" is a different failure from "the host did not answer",
+            // and wrapping it would turn the permanent, typed `Denied` into a
+            // retryable-looking endpoint error.
+            denied @ Error::Denied(_) => denied,
+            other => Error::Endpoint(format!(
                 "{who}: could not discover a model at `{}` — this provider declares no \
-                 `model`, and listing the server's models failed: {e}",
+                 `model`, and listing the server's models failed: {other}",
                 config.base_url
-            ))
+            )),
         })?;
     models
         .into_iter()
@@ -1691,10 +1765,10 @@ async fn installed_via_tags(
         .map_err(|e| Error::Endpoint(format!("llm: bad base_url `{}`: {e}", config.base_url)))?;
     let host = parsed.host_str().unwrap_or("");
     if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
-        return Err(Error::Endpoint(format!(
-            "urn:llm:{}:installed: capability does not allow reaching `{host}`",
-            config.provider
-        )));
+        return Err(net_denied(
+            &format!("urn:llm:{}:installed", config.provider),
+            host,
+        ));
     }
     let response = get(transport, url).await?;
     if response.status >= 400 {
@@ -1801,6 +1875,9 @@ impl Endpoint for InstalledEndpoint {
             .input(
                 ArgSpec::new("as")
                     .summary("text/plain newline list (default) or application/json")
+                    .class(XSD_STRING)
+                    .one_of(["text/plain", "application/json"])
+                    .default_value("text/plain")
                     .optional(),
             )
             .input(
@@ -1809,9 +1886,11 @@ impl Endpoint for InstalledEndpoint {
                         "keep only models with this capability (completion, embedding, \
                          tools, …); models whose capabilities are unknown always pass",
                     )
+                    .class(XSD_STRING)
                     .optional(),
             )
             .output("text/plain;charset=utf-8")
+            .output("application/json;charset=utf-8")
             .requires(CAP_NET)
     }
 }
@@ -1893,11 +1972,20 @@ fn require_net(inv: &Invocation<'_>, base_url: &str, path: &str, who: &str) -> R
         .map_err(|e| Error::Endpoint(format!("{who}: bad base_url `{base_url}`: {e}")))?;
     let host = parsed.host_str().unwrap_or("");
     if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
-        return Err(Error::Endpoint(format!(
-            "{who}: capability does not allow reaching `{host}` (needs urn:cap:net:{host})"
-        )));
+        return Err(net_denied(who, host));
     }
     Ok(url)
+}
+
+/// The per-host refusal: a typed, permanent [`Error::Denied`] — the same error
+/// the kernel's own floor raises when no `urn:cap:net:*` grant is held at all,
+/// so a caller, a trace and a wire error see one shape for "not authorized"
+/// whichever gate refused. It names the host (a grant is the fix), never the
+/// prompt.
+fn net_denied(who: &str, host: &str) -> Error {
+    Error::Denied(format!(
+        "{who}: capability does not allow reaching `{host}` (needs urn:cap:net:{host})"
+    ))
 }
 
 #[cfg(test)]
