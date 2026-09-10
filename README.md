@@ -16,6 +16,13 @@ addressable (`urn:llm:<provider>:ask`).
 Buffered (no streaming yet), single-turn, `urn:cap:net`-gated. Generation is
 non-deterministic, so results are uncacheable by default.
 
+Passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance):
+`tests/conformance.rs` walks every endpoint over a loopback stub speaking
+Ollama's API, and pins by hand what the suite cannot see — every network action
+refuses with a typed `Denied` before any socket opens (under no grants and under
+a grant on another host), an answer is never served from cache, and every
+config-derived result is cut by one golden thread, `urn:llm:config`.
+
 ### Inputs
 `prompt` (or piped `content`) · `model` · `system` · `temperature` · `max_tokens`
 · `as` (`application/json` for a `{text, model, usage}` envelope; default

@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -24,6 +24,10 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
+# The module recipe as one test (`tests/conformance.rs`). Its own floor on
+# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
+# true minimum of the API the LIBRARY uses.
+ikigai-conformance = "0.1.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
