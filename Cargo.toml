@@ -27,7 +27,7 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). Its own floor on
 # ikigai-core (0.1.67) is above the library's; the library's pin above stays the
 # true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
 # NOT imported — a FLOOR. `ikigai-conformance` reaches the vocabulary through
 # its own `^0.1.66`, and the VOCABULARY walk over this module's Turtle face is
 # only clean from 0.1.69, where `ik:batchAt` was defined (ikigai-core #107).
