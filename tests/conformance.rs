@@ -34,9 +34,9 @@
 //!
 //! Nothing is `pure`: every cacheable result reads the registry. No opt-outs:
 //! every action fires against the stub. No module namespace: the Turtle face
-//! uses `ik:` terms the shared vocabulary defines — all but one
-//! ([`batch_at_is_the_one_term_the_vocabulary_lacks`]). NAMES runs: every id is
-//! kebab-case.
+//! uses `ik:` terms the shared vocabulary defines — every one of them, load
+//! shape included ([`a_declared_load_shape_introduces_no_undefined_term`]).
+//! NAMES runs: every id is kebab-case.
 //!
 //! ## What the suite cannot see, pinned by hand
 //!
@@ -442,12 +442,18 @@ fn conforms_with_a_discovering_provider() {
     assert_stub_footprint(&stub, 3);
 }
 
-/// The Turtle face uses one term `ikigai-vocab` does not define yet:
-/// `ik:batchAt`, emitted only when a provider declares a load shape. Pinned
-/// as the exact finding a vocabulary arc will flip — when the vocabulary
-/// defines it, this test goes red and the line comes out.
+/// `ik:batchAt` is emitted only when a provider declares a load shape, so
+/// neither [`conforms`] nor [`conforms_with_a_discovering_provider`] walks a
+/// graph that carries it — the term would be covered by nothing. This walks
+/// one that does. It is the inverse of the pin it replaces: the vocabulary
+/// lacked `ik:batchAt` until 0.1.69, this asserted the finding, and defining
+/// the term flipped it (core #107, vocab 0.1.69).
+///
+/// It is not a string check: the check PARSES the face (oxrdfio) before reading
+/// its terms, so an unparseable graph is a finding too — which is what covers
+/// the `@prefix xsd:` line the tagged `ik:batchAt` literal now needs.
 #[test]
-fn batch_at_is_the_one_term_the_vocabulary_lacks() {
+fn a_declared_load_shape_introduces_no_undefined_term() {
     let stub = Stub::start();
     let mut registry = pinned(&stub);
     registry.providers[0].caps.batch_at = Some(2);
@@ -455,13 +461,7 @@ fn batch_at_is_the_one_term_the_vocabulary_lacks() {
         .checks(Checks::VOCABULARY)
         .run_blocking(&kernel(registry));
     eprintln!("{report}");
-    let findings: Vec<&str> = report.findings.iter().map(|f| f.detail.as_str()).collect();
-    assert_eq!(findings.len(), 1, "{report}");
-    assert_eq!(report.findings[0].endpoint, "llm-models", "{report}");
-    assert!(
-        findings[0].contains("https://ikigai-rs.dev/ns#batchAt"),
-        "{report}"
-    );
+    assert!(report.is_clean(), "{report}");
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {

@@ -118,6 +118,12 @@ is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 **queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
 `ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor` · `ik:batchAt`), so "a
 vision model with ≥32k context" becomes a SPARQL query over a resource.
+Every one of those terms is the **shared** vocabulary's, published at
+<https://ikigai-rs.dev/ns> — so the graph federates with every other ikigai
+graph instead of being module-local jargon, and the conformance walk fails on
+any term the vocabulary does not define. Literals carry the datatype the
+vocabulary's `rdfs:range` declares, which is what makes the Turtle and JSON-LD
+faces of the same inventory diff clean.
 
 Trait facts arrive at three strengths — **annotations > declared > discovered**:
 

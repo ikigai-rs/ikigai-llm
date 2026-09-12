@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -28,6 +28,14 @@ futures = "0.3"
 # ikigai-core (0.1.67) is above the library's; the library's pin above stays the
 # true minimum of the API the LIBRARY uses.
 ikigai-conformance = "0.1.0"
+# NOT imported — a FLOOR. `ikigai-conformance` reaches the vocabulary through
+# its own `^0.1.66`, and the VOCABULARY walk over this module's Turtle face is
+# only clean from 0.1.69, where `ik:batchAt` was defined (ikigai-core #107).
+# Under the looser transitive caret a stale registry index resolves 0.1.66 and
+# `a_declared_load_shape_introduces_no_undefined_term` fails on CI alone; this
+# line is what makes that resolution impossible. Remove it only when
+# `ikigai-conformance`'s own pin states 0.1.69 or later.
+ikigai-vocab = "0.1.69"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
