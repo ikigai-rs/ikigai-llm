@@ -985,12 +985,28 @@ impl ModelsEndpoint {
         json!({ "default": registry.default, "models": models })
     }
 
-    /// The trait graph. Vocabulary is module-local for now (`ik:LlmBackend`,
+    /// The trait graph. Every term is `ikigai-vocab`'s (`ik:LlmBackend`,
     /// `ik:model`, `ik:context`, `ik:modality`, `ik:tools`, `ik:jsonMode`,
-    /// `ik:cost`, `ik:params`, `ik:batchAt`) — promotion into ikigai-vocab is a
-    /// follow-up.
+    /// `ik:cost`, `ik:params`, `ik:batchAt`) — `ik:batchAt` was the last
+    /// holdout and landed in 0.1.69. `tests/conformance.rs` walks the whole
+    /// graph against the published vocabulary and fails on any term it does
+    /// not define, so this list cannot drift silently.
+    ///
+    /// Datatypes follow the declared `rdfs:range`, because the JSON-LD context
+    /// is GENERATED from it: a bare Turtle integer is `xsd:integer`, and
+    /// `ik:batchAt` ranges over `xsd:positiveInteger`, so it is tagged by hand.
+    /// Value-equal is not term-equal — an untagged one makes `urn:rdf:diff`
+    /// between this face and the JSON-LD one report a difference that is not
+    /// real. `ik:context` (`xsd:integer`) and the two booleans already agree
+    /// with Turtle's shorthand and stay bare.
     fn as_turtle(registry: &Registry) -> String {
-        let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
+        // `xsd:` is declared unconditionally (an unused prefix is legal
+        // Turtle) rather than only when a load shape is present: a header that
+        // varies with the data is a second thing to get wrong.
+        let mut ttl = String::from(
+            "@prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+        );
         for p in &registry.providers {
             let mut props = vec!["a ik:LlmBackend".to_string()];
             // Absent when a discovering provider's backend could not be reached:
@@ -1020,7 +1036,9 @@ impl ModelsEndpoint {
                 props.push(format!("ik:params {}", ttl_str(pr)));
             }
             if let Some(b) = p.caps.batch_at {
-                props.push(format!("ik:batchAt {b}"));
+                // Tagged, not bare: bare would be `xsd:integer`, the range is
+                // `xsd:positiveInteger` — see the datatype note above.
+                props.push(format!("ik:batchAt \"{b}\"^^xsd:positiveInteger"));
             }
             ttl.push_str(&format!(
                 "\n<urn:llm:{}:ask> {} .\n",
@@ -2438,6 +2456,53 @@ mod tests {
         assert!(msg.contains("ollama"), "names what was available: {msg}");
     }
 
+    /// The emitted literal's DATATYPE, not just its value.
+    ///
+    /// `ikigai-vocab` declares `ik:batchAt rdfs:range xsd:positiveInteger`, and
+    /// the JSON-LD context is GENERATED from that range — so the JSON-LD face of
+    /// this same graph coerces the number to `xsd:positiveInteger`. A bare
+    /// Turtle integer is `xsd:integer`. Both are value-correct and the range
+    /// assertion holds either way, so nothing about the graph is WRONG — but the
+    /// two literals are not TERM-equal, and `urn:rdf:diff` between the two faces
+    /// reports a difference that is not real. That is exactly the kind of fact
+    /// that drifts in silence: a doc comment stating the shape of something
+    /// leaving the process, with no test reading it.
+    ///
+    /// `ik:context` is the control. Its range is `xsd:integer`, which is what
+    /// Turtle's bare-integer shorthand already means, so it stays bare — the
+    /// asymmetry is deliberate, not an oversight in one of the two.
+    #[test]
+    fn the_turtle_face_tags_a_literal_whose_range_turtle_cannot_abbreviate() {
+        let ttl = String::from_utf8(
+            issue(
+                &kernel_for(FANOUT),
+                Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap())
+                    .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec())),
+            )
+            .bytes,
+        )
+        .unwrap();
+
+        assert!(
+            ttl.contains("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> ."),
+            "a tagged literal needs its prefix declared: {ttl}"
+        );
+        assert!(
+            ttl.contains("ik:batchAt \"2\"^^xsd:positiveInteger"),
+            "{ttl}"
+        );
+        assert!(
+            !ttl.contains("ik:batchAt 2"),
+            "a bare integer would serialize as xsd:integer: {ttl}"
+        );
+        // The control: a range Turtle's shorthand already produces.
+        assert!(ttl.contains("ik:context 32768"), "{ttl}");
+        assert!(
+            !ttl.contains("ik:context \""),
+            "xsd:integer needs no tag: {ttl}"
+        );
+    }
+
     #[test]
     fn declaring_a_load_shape_changes_nothing_that_did_not_ask_for_it() {
         // The two registries differ ONLY in the `batchAt` key. Every needs=
@@ -2483,7 +2548,10 @@ mod tests {
             .bytes,
         )
         .unwrap();
-        assert!(ttl.contains("ik:batchAt 2"), "{ttl}");
+        assert!(
+            ttl.contains("ik:batchAt \"2\"^^xsd:positiveInteger"),
+            "{ttl}"
+        );
         assert_eq!(
             ttl.matches("ik:batchAt").count(),
             1,
