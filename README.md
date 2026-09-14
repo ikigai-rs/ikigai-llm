@@ -4,7 +4,7 @@ Flexible LLM inference as ikigai ROC resources: one **facade grammar**
 (`urn:llm:ask`) dispatches to pluggable **backend modules**, each also directly
 addressable (`urn:llm:<provider>:ask`).
 
-## Slice 0 (this crate today)
+## What it binds today
 - **`urn:llm:ask`** — the facade. Picks a backend (`provider=` arg, else the
   configured default) and re-issues the request to `urn:llm:<provider>:ask`
   through the kernel (so the backend's cache validity / golden threads propagate).
