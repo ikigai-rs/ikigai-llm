@@ -601,8 +601,20 @@ fn config_derived_results_are_cut_by_the_registry_thread() {
         let repr = futures::executor::block_on(kernel.issue(req.clone(), &root))
             .unwrap_or_else(|e| panic!("{}: {e}", req.target));
         assert_eq!(repr.expiry, Expiry::Never, "{}", req.target);
+        // Since core 0.1.73 the kernel also hangs every cacheable answer from its
+        // own canonical target's thread (ledger #512 hole A), so the set is the
+        // registry thread plus, at most, the request's own name: never a foreign
+        // thread. Spelled to hold on either side of 0.1.73.
         let threads: Vec<String> = repr.threads().iter().map(|t| t.to_string()).collect();
-        assert_eq!(threads, [CONFIG_THREAD], "{}", req.target);
+        let own = req.target.as_str();
+        assert!(
+            threads.iter().any(|t| t == CONFIG_THREAD),
+            "{own}: hangs from the registry thread, got {threads:?}"
+        );
+        assert!(
+            threads.iter().all(|t| t == CONFIG_THREAD || t == own),
+            "{own}: carries only the registry thread and its own name, got {threads:?}"
+        );
         assert!(kernel.is_cached(req, &root), "{}", req.target);
     }
     kernel.cut(CONFIG_THREAD);
