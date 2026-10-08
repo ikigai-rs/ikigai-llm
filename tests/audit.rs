@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, ContentId, Error, Expiry, Iri, Kernel, Request, Verb};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
-use ikigai_llm::{space, Registry};
+use ikigai_llm::{space, OpenAiConfig, Registry};
 
 // ---- a scripted stub transport --------------------------------------------------
 
@@ -41,6 +41,13 @@ impl Stub {
 
     fn urls(&self) -> Vec<String> {
         self.sent().into_iter().map(|r| r.url).collect()
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.sent()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
     }
 }
 
@@ -478,4 +485,381 @@ fn select_declares_the_net_capability() {
         &scoped(&[]),
     );
     assert!(matches!(denied, Err(Error::Denied(_))), "{denied:?}");
+}
+
+// ---- minors ------------------------------------------------------------------------
+
+/// `ctx>=18014398509481985k` is 2^64 + 1024 tokens: the unchecked multiply
+/// panicked in debug and wrapped to 1024 in release, SELECTING a 128k backend
+/// (Claude r4).
+#[test]
+fn an_oversized_context_requirement_is_refused_not_wrapped() {
+    let k = kernel(
+        ok_stub(),
+        registry(
+            r#"{ "default": "fast", "providers": { "fast": {
+            "base_url": "http://localhost:11434/v1", "model": "m",
+            "caps": { "context": 131072, "cost": "local" } } } }"#,
+        ),
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        root(
+            &k,
+            req("urn:llm:select", &[("needs", "ctx>=18014398509481985k")]),
+        )
+    }));
+    match outcome {
+        Err(_) => panic!("urn:llm:select panicked on a caller-supplied needs= value"),
+        Ok(Ok(rep)) => panic!("2^64+1024 tokens selected {}", text(&rep)),
+        Ok(Err(e)) => assert!(
+            matches!(e, Error::InvalidArgument { .. }),
+            "an unrepresentable count is a grammar error: {e:?}"
+        ),
+    }
+}
+
+/// A raw line break inside a `"…"` literal is not Turtle, and a discovering
+/// provider's model id comes from the SERVER (Claude r5, Hermes bug11).
+#[test]
+fn the_turtle_inventory_parses_whatever_the_server_reports() {
+    let stub = Stub::new(|r| {
+        if r.url.ends_with("/models") {
+            reply(
+                200,
+                r#"{"data":[{"id":"qwen3\nlatest\r","modality":"te\nxt"}]}"#,
+            )
+        } else {
+            reply(404, "{}")
+        }
+    });
+    let k = kernel(
+        stub,
+        registry(
+            r#"{ "default": "rapid", "providers": { "rapid": { "base_url": "http://localhost:8000/v1" } } }"#,
+        ),
+    );
+    let ttl = root(&k, req("urn:llm:models", &[("as", "text/turtle")])).unwrap();
+    let parsed = ikigai_conformance::rdf::parse("text/turtle", &ttl.bytes);
+    assert!(parsed.is_ok(), "invalid Turtle {parsed:?}:\n{}", text(&ttl));
+    let triples = parsed.unwrap();
+    assert!(
+        format!("{triples:?}").contains(r"qwen3\nlatest\r"),
+        "the value survives the round trip: {triples:?}"
+    );
+}
+
+/// A `default` that names no provider loaded; every unrouted ask then failed and
+/// the inventory asserted a route to nothing (Claude r7, Hermes bug8).
+#[test]
+fn a_default_naming_no_provider_is_refused_at_load() {
+    let err = Registry::from_json(
+        r#"{ "default": "nope", "providers": {
+        "fast": { "base_url": "http://localhost:11434/v1", "model": "m" } } }"#,
+    )
+    .expect_err("a default naming no provider must not load");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("nope") && msg.contains("fast"), "{msg}");
+}
+
+/// After the default-model fallback the span was labeled with the model that
+/// 404'd, not the one that answered (Claude r8).
+#[test]
+fn the_trace_names_the_model_that_answered_after_the_fallback() {
+    struct Rec(Mutex<Vec<ikigai_core::TraceEvent>>);
+    impl ikigai_core::Tracer for Rec {
+        fn record(&self, event: ikigai_core::TraceEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let stub = Stub::new(|r| {
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        if r.url.ends_with("/chat/completions") {
+            if body.contains("\"ghost\"") {
+                reply(404, r#"{"error":{"message":"model not found"}}"#)
+            } else {
+                reply(
+                    200,
+                    r#"{"model":"small:3b","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        } else if r.url.ends_with("/api/tags") {
+            reply(200, r#"{"models":[{"name":"small:3b","size":2000000000}]}"#)
+        } else if r.url.ends_with("/api/show") {
+            reply(200, r#"{"capabilities":["completion"]}"#)
+        } else {
+            reply(404, "{}")
+        }
+    });
+    let k = kernel(stub, Registry::single(OpenAiConfig::ollama("ghost")));
+    let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+    let out = futures::executor::block_on(k.issue_traced(
+        req("urn:llm:ollama:ask", &[("prompt", "hi")]),
+        &Capability::root(),
+        rec.clone(),
+    ))
+    .unwrap();
+    assert_eq!(text(&out), "hi", "the fallback answered");
+    let events = rec.0.lock().unwrap();
+    let span = events
+        .iter()
+        .find(|e| e.target == "urn:llm:ollama:ask")
+        .unwrap();
+    let models: Vec<&String> = span
+        .notes
+        .iter()
+        .filter(|(k, _)| k == "model")
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(models, ["small:3b"], "the span names the answering model");
+}
+
+/// The facade tested `if let Ok(needs) = …`, so a `needs=` it could not read (a
+/// reference to a policy resource, an interned value) was dropped and the ask
+/// went to the DEFAULT — here the very vendor the expression excludes (Claude
+/// r9). `provider=` had the same shape.
+#[test]
+fn an_unreadable_routing_input_is_refused_not_ignored() {
+    let stub = ok_stub();
+    let k = kernel(
+        stub.clone(),
+        registry(
+            r#"{ "default": "posh", "providers": {
+            "posh":  { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "k",
+                       "caps": { "vendor": "openai", "cost": "premium" } },
+            "local": { "base_url": "http://localhost:11434/v1", "model": "m",
+                       "caps": { "vendor": "mlx", "cost": "local" } } } }"#,
+        ),
+    );
+    for name in ["needs", "provider"] {
+        for (label, value) in [
+            (
+                "reference",
+                ArgRef::Reference(Iri::parse("urn:policy:no-openai").unwrap()),
+            ),
+            ("content", ArgRef::Content(ContentId::of(b"vendor!=openai"))),
+        ] {
+            let r = req("urn:llm:ask", &[("prompt", "hi")]).with_arg(name, value);
+            let out = root(&k, r);
+            assert!(
+                matches!(out, Err(Error::InvalidArgument { .. })),
+                "{name}= as {label} was not refused: {:?}",
+                out.map(|r| text(&r))
+            );
+        }
+    }
+    assert!(stub.urls().is_empty(), "routed anyway: {:?}", stub.urls());
+}
+
+/// A JSON error body without `error.message` fell through verbatim; FastAPI's
+/// 422 carries the offending request value, so the prompt reached the error
+/// (Claude r10).
+#[test]
+fn a_structured_error_body_does_not_carry_the_prompt_into_the_error() {
+    const PROMPT: &str = "SECRET-PROMPT-never-echoed";
+    let stub = Stub::new(|r| {
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let body = serde_json::json!({ "detail": [ {
+            "type": "string_too_long", "loc": ["body", "messages", 0, "content"],
+            "msg": "String should have at most 8 characters",
+            "input": v["messages"][0]["content"] } ] });
+        reply(422, &body.to_string())
+    });
+    let k = kernel(stub, Registry::single(OpenAiConfig::ollama("m")));
+    let err = root(
+        &k,
+        req("urn:llm:ollama:ask", &[("prompt", PROMPT), ("model", "m")]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!err.contains(PROMPT), "the prompt is in the error: {err}");
+    assert!(
+        err.contains("String should have at most 8 characters"),
+        "the reason is kept: {err}"
+    );
+    // A plain-text body that echoes the prompt is scrubbed too.
+    let stub = Stub::new(|r| {
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        reply(
+            400,
+            &format!(
+                "bad request: {}",
+                v["messages"][0]["content"].as_str().unwrap()
+            ),
+        )
+    });
+    let k = kernel(stub, Registry::single(OpenAiConfig::ollama("m")));
+    let err = root(
+        &k,
+        req("urn:llm:ollama:ask", &[("prompt", PROMPT), ("model", "m")]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!err.contains(PROMPT), "the prompt is in the error: {err}");
+}
+
+/// An additive `modality` annotation discarded every discovered modality on a
+/// provider that declared none (Claude r11).
+#[test]
+fn an_added_modality_keeps_the_discovered_ones() {
+    let stub = Stub::new(|r| {
+        if r.url.ends_with("/api/show") {
+            reply(200, r#"{"capabilities":["completion"]}"#)
+        } else {
+            reply(404, "{}")
+        }
+    });
+    let mut reg = registry(
+        r#"{ "default": "o", "providers": { "o": {
+        "base_url": "http://localhost:11434/v1", "model": "m",
+        "caps": { "vendor": "ollama", "cost": "local" } } } }"#,
+    );
+    let before = kernel(stub.clone(), reg.clone());
+    assert_eq!(
+        text(&root(&before, req("urn:llm:select", &[("needs", "text")])).unwrap()),
+        "urn:llm:o:ask"
+    );
+    assert!(reg
+        .apply_annotations(&[("o", "ik:modality", "vision")])
+        .is_empty());
+    let after = kernel(stub, reg);
+    let out = root(&after, req("urn:llm:select", &[("needs", "text, vision")]));
+    assert_eq!(
+        out.as_ref().map(text).ok().as_deref(),
+        Some("urn:llm:o:ask"),
+        "adding `vision` dropped the discovered `text`: {:?}",
+        out.err()
+    );
+}
+
+/// Typed inputs that do not parse were silently dropped (`temperature=abc`
+/// sent no temperature), a non-finite temperature was sent as JSON `null`, and
+/// `max_tokens=0` (declared `xsd:positiveInteger`) was sent as 0 (Hermes bug3,
+/// bug7, and its suspected `max_tokens=0`).
+#[test]
+fn a_typed_input_that_does_not_parse_is_refused_not_dropped() {
+    for (name, value) in [
+        ("temperature", "abc"),
+        ("temperature", "NaN"),
+        ("temperature", "inf"),
+        ("temperature", "-inf"),
+        ("max_tokens", "abc"),
+        ("max_tokens", "0"),
+        ("max_tokens", "-3"),
+    ] {
+        let stub = ok_stub();
+        let k = kernel(stub.clone(), Registry::single(OpenAiConfig::ollama("m")));
+        let out = root(
+            &k,
+            req("urn:llm:ollama:ask", &[("prompt", "hi"), (name, value)]),
+        );
+        assert!(
+            matches!(&out, Err(Error::InvalidArgument { name: n, .. }) if n == name),
+            "{name}={value} was not refused: {:?}; sent {:?}",
+            out.map(|r| text(&r)),
+            stub.bodies()
+        );
+        assert!(stub.urls().is_empty(), "{name}={value}: a request was sent");
+    }
+    // The valid forms still reach the payload.
+    let stub = ok_stub();
+    let k = kernel(stub.clone(), Registry::single(OpenAiConfig::ollama("m")));
+    root(
+        &k,
+        req(
+            "urn:llm:ollama:ask",
+            &[
+                ("prompt", "hi"),
+                ("temperature", "0.2"),
+                ("max_tokens", "64"),
+            ],
+        ),
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&stub.bodies()[0]).unwrap();
+    assert_eq!(body["temperature"], 0.2);
+    assert_eq!(body["max_tokens"], 64);
+}
+
+/// The 404 default-model fallback on the OpenAI-compat path retried with the
+/// FIRST listed model, though that listing says nothing about what can chat —
+/// here an embedder (Hermes bug12). A substitution needs evidence.
+#[test]
+fn the_fallback_never_substitutes_a_model_not_known_to_chat() {
+    let stub = Stub::new(|r| {
+        if r.url.ends_with("/models") {
+            reply(
+                200,
+                r#"{"object":"list","data":[{"id":"embed-only"},{"id":"chat-model"}]}"#,
+            )
+        } else if String::from_utf8_lossy(&r.body).contains("\"ghost\"") {
+            reply(404, r#"{"error":{"message":"model not found"}}"#)
+        } else {
+            reply(200, CANNED)
+        }
+    });
+    let k = kernel(
+        stub.clone(),
+        registry(
+            r#"{ "default": "s", "providers": { "s": {
+            "base_url": "http://localhost:8000/v1", "model": "ghost",
+            "caps": { "vendor": "mlx" } } } }"#,
+        ),
+    );
+    let out = root(&k, req("urn:llm:s:ask", &[("prompt", "hi")]));
+    assert!(
+        !stub.bodies().iter().any(|b| b.contains("embed-only")),
+        "retried with the embedder: {:?}",
+        stub.bodies()
+    );
+    let err = out.expect_err("no known chat model: the 404 surfaces");
+    assert!(err.to_string().contains("404"), "{err}");
+}
+
+/// A cost tier outside the vocabulary loaded and then silently failed every
+/// cost-based requirement (Hermes bug13).
+#[test]
+fn an_unknown_cost_tier_is_refused_at_load() {
+    let err = Registry::from_json(
+        r#"{ "default": "a", "providers": { "a": {
+        "base_url": "http://localhost:11434/v1", "model": "m",
+        "caps": { "cost": "freemium" } } } }"#,
+    )
+    .expect_err("an unknown cost tier must not load");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("freemium") && msg.contains("`a`"), "{msg}");
+}
+
+/// A mistyped `caps` key (`batchat`) was ignored by serde, so the declared load
+/// shape vanished at load time (Hermes bug14). A mistyped entry key (`modle`)
+/// is the same silence one level up: it turned a pinned provider into a
+/// discovering one.
+#[test]
+fn an_unknown_key_is_refused_at_load() {
+    for (label, json) in [
+        (
+            "caps",
+            r#"{ "default": "r", "providers": { "r": {
+            "base_url": "http://localhost:8000/v1", "model": "q",
+            "caps": { "vendor": "mlx", "batchat": 2 } } } }"#,
+        ),
+        (
+            "entry",
+            r#"{ "default": "r", "providers": { "r": {
+            "base_url": "http://localhost:8000/v1", "modle": "q" } } }"#,
+        ),
+    ] {
+        let err = Registry::from_json(json)
+            .err()
+            .unwrap_or_else(|| panic!("an unknown {label} key loaded"));
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown field"), "{label}: {msg}");
+    }
+    // Both spellings of the load shape still load.
+    for key in ["batchAt", "batch_at"] {
+        let reg = registry(&format!(
+            r#"{{ "default": "r", "providers": {{ "r": {{
+            "base_url": "http://localhost:8000/v1", "model": "q", "caps": {{ "{key}": 2 }} }} }} }}"#
+        ));
+        assert_eq!(reg.providers[0].caps.batch_at, Some(2), "{key}");
+    }
 }

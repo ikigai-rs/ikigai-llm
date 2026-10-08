@@ -88,6 +88,9 @@ const XSD_POSITIVE_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#positiveInt
 /// **provenance**, not the use, and `batch_at` (a routing trait no endpoint on
 /// earth advertises) is what forced the distinction into the open.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+// An unknown key is refused, not ignored: `batchat` (for `batchAt`) loaded as
+// "no load shape declared", the silence `batchAt: 0` is refused for.
+#[serde(deny_unknown_fields)]
 pub struct Caps {
     /// Context window, in tokens.
     #[serde(default)]
@@ -231,8 +234,14 @@ impl Registry {
     /// behind a server needs no config edit and no restart (the registry is read
     /// once at kernel construction — there is no watcher). Declared `caps` still
     /// win over anything the server says about itself.
+    ///
+    /// **Refused at load**, naming what is wrong rather than loading a registry
+    /// that misroutes in silence: an unknown key at any level (`batchat`,
+    /// `modle`), a `cost` outside `local` | `cheap` | `premium`, `batchAt: 0`,
+    /// and a `default` that names no configured provider.
     pub fn from_json(json: &str) -> Result<Self> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Entry {
             base_url: String,
             #[serde(default, alias = "default_model")]
@@ -243,6 +252,7 @@ impl Registry {
             caps: Caps,
         }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Doc {
             default: String,
             providers: BTreeMap<String, Entry>,
@@ -271,6 +281,33 @@ impl Registry {
                  threshold is a number of concurrent requests, so the smallest \
                  meaningful value is 1",
                 bad.provider
+            )));
+        }
+        // A cost tier outside the vocabulary would load, then satisfy no
+        // `cost` requirement and sort last — the silent misroute the query side
+        // already refuses ("a typo must not mis-select"). Refused here the same.
+        if let Some(bad) = providers.iter().find(|p| {
+            p.caps
+                .cost
+                .as_deref()
+                .is_some_and(|c| cost_rank(c).is_none())
+        }) {
+            return Err(Error::Endpoint(format!(
+                "urn:llm:config: provider `{}` declares `cost: {}` — the tiers are \
+                 local, cheap and premium",
+                bad.provider,
+                bad.caps.cost.as_deref().unwrap_or_default()
+            )));
+        }
+        // A default naming no provider would load, fail every unrouted ask, and
+        // have the trait graph assert a route to a backend that does not exist.
+        if !providers.iter().any(|p| p.provider == doc.default) {
+            let names: Vec<&str> = providers.iter().map(|p| p.provider.as_str()).collect();
+            return Err(Error::Endpoint(format!(
+                "urn:llm:config: `default` names `{}`, which is not a configured \
+                 provider (providers: {})",
+                doc.default,
+                names.join(", ")
             )));
         }
         Ok(Registry {
@@ -502,9 +539,15 @@ impl Endpoint for AskFacade {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // Explicit `provider=` wins; then `needs=` (capability-based selection);
         // then the configured default.
-        let provider = if let Ok(name) = inv.inline_str("provider") {
+        // Both routing inputs are read strictly: one supplied in a form this
+        // facade cannot read is refused, never treated as absent — absent means
+        // "the default", and a policy the facade could not read must not route
+        // to it.
+        let provider = optional_str(inv, "provider")?;
+        let needs = optional_str(inv, "needs")?;
+        let provider = if let Some(name) = provider {
             name.to_string()
-        } else if let Ok(needs) = inv.inline_str("needs") {
+        } else if let Some(needs) = needs {
             parse_needs(needs)?;
             let (effective, _) = effective_registry(&self.registry, &self.transport, inv).await;
             select_reachable(inv, &effective, needs, "urn:llm:ask")?
@@ -583,12 +626,23 @@ impl Endpoint for OpenAiBackend {
             .inline_str("prompt")
             .or_else(|_| inv.inline_str("content"))
             .map_err(|_| Error::MissingArgument("prompt".to_string()))?;
+        // Every optional input is read, and refused if unreadable, BEFORE any
+        // request leaves: a malformed one costs no probe and sends nothing.
+        let named_model = optional_str(inv, "model")?;
+        let system = optional_str(inv, "system")?;
+        let temperature = optional_str(inv, "temperature")?
+            .map(parse_temperature)
+            .transpose()?;
+        let max_tokens = optional_str(inv, "max_tokens")?
+            .map(parse_max_tokens)
+            .transpose()?;
+
         // `model=` wins verbatim — always, for a discovering provider too: the
         // caller named a model, and naming one is never a request to go looking.
         // Otherwise: the configured id, else whatever the server serves now.
-        let model = match inv.inline_str("model") {
-            Ok(named) => named.to_string(),
-            Err(_) => {
+        let model = match named_model {
+            Some(named) => named.to_string(),
+            None => {
                 resolve_model(
                     self.transport.as_ref(),
                     inv,
@@ -600,63 +654,70 @@ impl Endpoint for OpenAiBackend {
             }
         };
 
-        // Label this span with what the selection actually chose — the trace
-        // answers "on which model, at which provider/tier" by name instead of
-        // leaving it implicit in the target IRI (a free no-op untraced).
-        inv.trace_note("model", &model);
-        inv.trace_note("provider", &self.config.provider);
-        if let Some(cost) = &self.config.caps.cost {
-            inv.trace_note("cost", cost);
-        }
-
         let mut messages = Vec::new();
-        if let Ok(system) = inv.inline_str("system") {
+        if let Some(system) = system {
             messages.push(json!({ "role": "system", "content": system }));
         }
         messages.push(json!({ "role": "user", "content": prompt }));
 
         let mut payload = json!({ "model": model, "messages": messages, "stream": false });
-        if let Ok(t) = inv.inline_str("temperature").and_then(parse_f64) {
+        if let Some(t) = temperature {
             payload["temperature"] = json!(t);
         }
-        if let Ok(m) = inv.inline_str("max_tokens").and_then(parse_u64) {
+        if let Some(m) = max_tokens {
             payload["max_tokens"] = json!(m);
         }
 
         let headers = provider_headers(&self.config, true);
-
-        let explicit_model = inv.inline_str("model").is_ok();
         let mut response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+        let mut answered_by = model;
 
         // The configured DEFAULT model may not exist on this machine's server
         // (the demo moved hosts, the model was never pulled). A request that
         // names `model=` explicitly errors honestly — never substitute — but a
         // defaulted one resolves against what IS installed and retries once.
-        if response.status == 404 && !explicit_model {
-            // Smallest CHAT-capable model — an embedder may sort first (they're
-            // tiny) but can't answer a chat request.
+        if response.status == 404 && named_model.is_none() {
+            // Smallest model the server SAYS can chat. A substitution the caller
+            // did not ask for needs evidence: an embedder may sort first
+            // (they're tiny) but can't answer a chat request, and a listing
+            // that says nothing about capabilities (the OpenAI-compat
+            // `/models`) is not evidence — "unknown passes" is the rule for
+            // listing and discovery, never for substituting. No evidence, no
+            // retry: the 404 surfaces.
             let fallback = installed_models(self.transport.as_ref(), inv, &self.config)
                 .await
                 .ok()
                 .and_then(|models| {
                     models
                         .into_iter()
-                        .find(|m| model_supports(m, "completion"))
+                        .find(|m| m.capabilities.iter().any(|c| c == "completion"))
                         .map(|m| m.model)
                 });
             if let Some(first) = fallback {
-                if first != model {
+                if first != answered_by {
                     payload["model"] = json!(first);
                     response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+                    answered_by = first;
                 }
             }
         }
 
+        // Label this span with what actually answered — the trace says "on which
+        // model, at which provider/tier" by name instead of leaving it implicit
+        // in the target IRI (a free no-op untraced). Noted once, after the
+        // fallback: labeling the model that 404'd named the wrong one.
+        inv.trace_note("model", &answered_by);
+        inv.trace_note("provider", &self.config.provider);
+        if let Some(cost) = &self.config.caps.cost {
+            inv.trace_note("cost", cost);
+        }
+
         if response.status >= 400 {
+            let caller_text: Vec<&str> = std::iter::once(prompt).chain(system).collect();
             return Err(Error::Endpoint(format!(
                 "llm backend returned {}: {}",
                 response.status,
-                error_detail(&response.body)
+                error_detail(&response.body, &caller_text)
             )));
         }
 
@@ -676,7 +737,7 @@ impl Endpoint for OpenAiBackend {
         if want_json {
             let envelope = json!({
                 "text": text,
-                "model": parsed["model"].as_str().unwrap_or(model.as_str()),
+                "model": parsed["model"].as_str().unwrap_or(answered_by.as_str()),
                 "finish_reason": choice["finish_reason"].as_str(),
                 "usage": parsed.get("usage").cloned().unwrap_or(Value::Null),
             });
@@ -704,37 +765,107 @@ impl Endpoint for OpenAiBackend {
     }
 }
 
-/// What an error response contributes to our error text: the `error.message`
-/// of an OpenAI-shaped body (the one field that shape defines as the human
-/// reason), else the body verbatim. An error travels through traces, logs and
-/// MCP replies, so the structured case carries the reason and nothing else of
-/// what the server chose to echo; an unstructured body has no field to prefer.
-fn error_detail(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v["error"]["message"]
-                .as_str()
-                .or_else(|| v["error"].as_str())
-                .map(str::to_string)
+/// What an error response contributes to our error text. An error travels
+/// through traces, logs and MCP replies, so it carries the server's REASON and
+/// nothing else of what the server chose to echo:
+///
+/// * a JSON body contributes its human-readable fields only — OpenAI's
+///   `error.message` (or a bare `error` string), a top-level `message` or
+///   `detail` string, or the `msg` of each FastAPI/pydantic `detail[]` entry. A
+///   JSON body in none of those shapes contributes its field NAMES, never its
+///   values: FastAPI's 422 carries the offending request value (`input`), which
+///   is the prompt.
+/// * any other body is kept verbatim.
+///
+/// Either way, `caller_text` (the prompt and system prompt) is cut from the
+/// result, in its raw and its JSON-escaped spelling, wherever a server echoed it.
+fn error_detail(body: &[u8], caller_text: &[&str]) -> String {
+    let detail = match serde_json::from_slice::<Value>(body) {
+        Ok(v) => structured_reason(&v),
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    };
+    caller_text
+        .iter()
+        .filter(|t| !t.is_empty())
+        .fold(detail, |detail, text| {
+            let escaped = serde_json::to_string(text).unwrap_or_default();
+            let escaped = escaped.trim_matches('"');
+            detail
+                .replace(*text, "[prompt]")
+                .replace(escaped, "[prompt]")
         })
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
 }
 
-/// `Ok(v)` when `s` parses as an `f64`, else a throwaway error (so callers use
-/// `.and_then(parse_f64)` and ignore unparseable values).
-fn parse_f64(s: &str) -> Result<f64> {
-    s.parse::<f64>().map_err(|_| Error::InvalidArgument {
-        name: "temperature".to_string(),
-        detail: "expected a number".to_string(),
-    })
+/// The reason a JSON error body states, or the names of the fields it has.
+fn structured_reason(v: &Value) -> String {
+    if let Some(m) = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+    {
+        return m.to_string();
+    }
+    for field in ["message", "detail"] {
+        if let Some(m) = v[field].as_str() {
+            return m.to_string();
+        }
+    }
+    if let Some(entries) = v["detail"].as_array() {
+        let msgs: Vec<&str> = entries.iter().filter_map(|e| e["msg"].as_str()).collect();
+        if !msgs.is_empty() {
+            return msgs.join("; ");
+        }
+    }
+    match v.as_object() {
+        Some(fields) => format!(
+            "unrecognized error body (fields: {})",
+            fields
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "unrecognized error body".to_string(),
+    }
 }
 
-fn parse_u64(s: &str) -> Result<u64> {
-    s.parse::<u64>().map_err(|_| Error::InvalidArgument {
-        name: "max_tokens".to_string(),
-        detail: "expected an integer".to_string(),
-    })
+/// An optional inline argument: `None` when the caller did not supply it, an
+/// error when it was supplied in a form this endpoint cannot read (a reference,
+/// interned content, bytes that are not UTF-8). Testing `if let Ok(..) =
+/// inv.inline_str(..)` conflates the two, and for a routing input that fails
+/// OPEN: a `needs=vendor!=openai` carried by reference was dropped and the ask
+/// went to the default, which was OpenAI.
+fn optional_str<'i>(inv: &'i Invocation<'_>, name: &str) -> Result<Option<&'i str>> {
+    match inv.inline_str(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
+/// `temperature`, declared `xsd:double`: a finite number or a refusal. A value
+/// that does not parse used to be dropped (the request went without one), and a
+/// non-finite one was sent as JSON `null`, which JSON cannot represent otherwise.
+fn parse_temperature(s: &str) -> Result<f64> {
+    s.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|t| t.is_finite())
+        .ok_or_else(|| Error::InvalidArgument {
+            name: "temperature".to_string(),
+            detail: format!("expected a finite number, got `{s}`"),
+        })
+}
+
+/// `max_tokens`, declared `xsd:positiveInteger`: 1 or more, or a refusal.
+fn parse_max_tokens(s: &str) -> Result<u64> {
+    s.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| Error::InvalidArgument {
+            name: "max_tokens".to_string(),
+            detail: format!("expected a positive integer, got `{s}`"),
+        })
 }
 
 /// The shared parameter contract for the facade and the backends.
@@ -1060,9 +1191,18 @@ impl ModelsEndpoint {
     }
 }
 
-/// A Turtle string literal (quote-and-escape).
+/// A Turtle string literal (quote-and-escape). `STRING_LITERAL_QUOTE` excludes
+/// exactly four characters — `"`, `\`, LF and CR — and every one is escaped:
+/// a discovering provider's model id and modality come from the SERVER, so a
+/// line break in one must not make the trait graph unparseable.
 fn ttl_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
 }
 
 #[async_trait]
@@ -1190,10 +1330,19 @@ async fn discovered_caps(
 fn merge_declared_wins(declared: &Caps, discovered: Caps) -> Caps {
     Caps {
         context: declared.context.or(discovered.context),
-        modalities: if declared.modalities.is_empty() {
-            discovered.modalities
-        } else {
-            declared.modalities.clone()
+        // A SET, so "fill gaps" is a union: discovery adds a modality the
+        // declaration did not list, and the declaration (or an annotation, which
+        // lands here) adds one the server under-reports. Taking the declared list
+        // wholesale whenever it was non-empty meant one annotated `vision`
+        // erased every discovered modality, `text` included.
+        modalities: {
+            let mut all = declared.modalities.clone();
+            for m in discovered.modalities {
+                if !all.contains(&m) {
+                    all.push(m);
+                }
+            }
+            all
         },
         tools: declared.tools.or(discovered.tools),
         json: declared.json.or(discovered.json),
@@ -1327,11 +1476,14 @@ fn cost_rank(tier: &str) -> Option<u8> {
     }
 }
 
-/// A token count, allowing a `k` suffix (`32k` = 32 × 1024).
+/// A token count, allowing a `k` suffix (`32k` = 32 × 1024). A count that does
+/// not fit in 64 bits is `None` — a grammar error — never a wrapped number: an
+/// unchecked multiply panicked in a debug build and, in release, turned a
+/// requirement no backend meets into one a 128k backend does.
 fn parse_tokens(v: &str) -> Option<u64> {
     let v = v.trim();
     if let Some(n) = v.strip_suffix(['k', 'K']) {
-        n.trim().parse::<u64>().ok().map(|n| n * 1024)
+        n.trim().parse::<u64>().ok()?.checked_mul(1024)
     } else {
         v.parse::<u64>().ok()
     }
@@ -1934,8 +2086,9 @@ impl InstalledEndpoint {
 #[async_trait]
 impl Endpoint for InstalledEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let supports = optional_str(inv, "supports")?;
         let mut models = installed_models(self.transport.as_ref(), inv, &self.config).await?;
-        if let Ok(want) = inv.inline_str("supports") {
+        if let Some(want) = supports {
             models.retain(|m| model_supports(m, want));
         }
         let want_json = inv
