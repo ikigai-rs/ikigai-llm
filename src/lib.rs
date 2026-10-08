@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 /// constitution's rule for parameterized ACL families): the manifold offers the
 /// action to any capability holding SOME `urn:cap:net:*` grant, and the kernel's
 /// baseline `requires` enforcement (core ≥ 0.1.49) passes it on the same
-/// predicate; `require_net` then checks the actual host against the grant — the
-/// declared floor, the per-host ceiling.
+/// predicate; `require_net` then checks the actual host and port against the
+/// grant — the declared floor, the per-host ceiling.
 const CAP_NET: &str = "urn:cap:net:*";
 
 /// The golden thread every **config-derived** cacheable representation depends
@@ -503,9 +503,9 @@ impl Endpoint for AskFacade {
         let provider = if let Ok(name) = inv.inline_str("provider") {
             name.to_string()
         } else if let Ok(needs) = inv.inline_str("needs") {
+            parse_needs(needs)?;
             let effective = effective_registry(&self.registry, &self.transport, inv).await;
-            select(&effective, &parse_needs(needs)?)
-                .ok_or_else(|| no_match_error("urn:llm:ask", needs, &effective))?
+            select_reachable(inv, &effective, needs, "urn:llm:ask")?
                 .provider
                 .clone()
         } else {
@@ -621,10 +621,7 @@ impl Endpoint for OpenAiBackend {
             payload["max_tokens"] = json!(m);
         }
 
-        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        if let Some(key) = &self.config.api_key {
-            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
-        }
+        let headers = provider_headers(&self.config, true);
 
         let explicit_model = inv.inline_str("model").is_ok();
         let mut response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
@@ -788,7 +785,9 @@ fn ask_description(id: &str, summary: &str) -> Description {
 // ---- the config resource ----------------------------------------------------
 
 /// `urn:llm:config` — reports the effective registry (default + configured
-/// providers), with API keys **redacted** so the resource never leaks a secret.
+/// providers), with API keys **redacted** and any `user:password@` removed from
+/// a `base_url`, so the resource never leaks a secret. Those are the only two
+/// secret-bearing fields a provider entry has.
 pub struct ConfigEndpoint {
     registry: Registry,
 }
@@ -807,7 +806,9 @@ impl Endpoint for ConfigEndpoint {
             providers.insert(
                 p.provider.clone(),
                 json!({
-                    "base_url": p.base_url,
+                    // Userinfo removed: a proxy's `user:pass@` is a secret like
+                    // the key below, and this resource requires no capability.
+                    "base_url": redacted_url(&p.base_url),
                     // `null` for a provider that names the server: nothing is
                     // configured. This resource reports the REGISTRY, so it
                     // stays a pure config read — it never probes.
@@ -833,7 +834,7 @@ impl Endpoint for ConfigEndpoint {
         Description::new("llm-config")
             .summary(
                 "The effective LLM provider registry (default + configured backends; \
-                 API keys redacted).",
+                 API keys and URL credentials redacted).",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -968,7 +969,7 @@ impl ModelsEndpoint {
                 json!({
                     "backend": format!("urn:llm:{}:ask", p.provider),
                     "model": p.default_model,
-                    "base_url": p.base_url,
+                    "base_url": redacted_url(&p.base_url),
                     "caps": {
                         "context": caps.context,
                         "modalities": caps.modalities,
@@ -1092,7 +1093,10 @@ impl Endpoint for ModelsEndpoint {
             .summary(
                 "The annotated model inventory: every configured backend with its model \
                  and declared capability profile (context, modalities, tools, cost). \
-                 JSON by default; `as=text/turtle` renders the queryable trait graph.",
+                 JSON by default; `as=text/turtle` renders the queryable trait graph. \
+                 Needs no capability: where the caller's net grant reaches a backend \
+                 that offers discovery, gaps are filled live from it; otherwise the \
+                 declared profile stands.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -1132,8 +1136,7 @@ async fn discovered_caps(
         .trim_end_matches("/v1");
     let url = format!("{root}/api/show");
     let parsed = url::Url::parse(&url).ok()?;
-    let host = parsed.host_str().unwrap_or("");
-    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+    if !may_reach(inv, &parsed) {
         return None; // no capability -> no discovery; declared profile stands
     }
     // Needs a model to ask ABOUT. `effective_registry` resolves a discovering
@@ -1145,7 +1148,7 @@ async fn discovered_caps(
         .send(HttpRequest {
             method: Method::Post,
             url,
-            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            headers: provider_headers(provider, true),
             body,
         })
         .await
@@ -1398,13 +1401,18 @@ fn satisfies(provider: &OpenAiConfig, needs: &[Need]) -> bool {
 }
 
 /// The satisfying provider under the policy **cheapest-that-fits → smallest
-/// context → registry order** (an undeclared cost tier sorts last).
-fn select<'a>(registry: &'a Registry, needs: &[Need]) -> Option<&'a OpenAiConfig> {
+/// context → registry order** (an undeclared cost tier sorts last), among those
+/// `admit` lets through.
+fn select<'a>(
+    registry: &'a Registry,
+    needs: &[Need],
+    admit: impl Fn(&OpenAiConfig) -> bool,
+) -> Option<&'a OpenAiConfig> {
     registry
         .providers
         .iter()
         .enumerate()
-        .filter(|(_, p)| satisfies(p, needs))
+        .filter(|(_, p)| satisfies(p, needs) && admit(p))
         .min_by_key(|(i, p)| {
             (
                 p.caps.cost.as_deref().and_then(cost_rank).unwrap_or(3),
@@ -1413,6 +1421,42 @@ fn select<'a>(registry: &'a Registry, needs: &[Need]) -> Option<&'a OpenAiConfig
             )
         })
         .map(|(_, p)| p)
+}
+
+/// Selection as a caller sees it: the winner among the backends **this
+/// invocation's capability can reach** — a backend it could not ask is not an
+/// answer, and reporting one would hand a caller the identity (IRI, model,
+/// vendor) of a backend its grant withholds. When something satisfies `needs`
+/// but nothing reachable does, that is an authorization failure, typed
+/// [`Error::Denied`], and it names no backend; when nothing satisfies at all,
+/// it is the ordinary no-match.
+fn select_reachable<'a>(
+    inv: &Invocation<'_>,
+    registry: &'a Registry,
+    needs_text: &str,
+    who: &str,
+) -> Result<&'a OpenAiConfig> {
+    let needs = parse_needs(needs_text)?;
+    if let Some(winner) = select(registry, &needs, |p| reachable(inv, p)) {
+        return Ok(winner);
+    }
+    if select(registry, &needs, |_| true).is_some() {
+        return Err(Error::Denied(format!(
+            "{who}: no backend this capability may reach satisfies `{needs_text}` \
+             (a urn:cap:net grant for the backend's host is the fix)"
+        )));
+    }
+    Err(no_match_error(who, needs_text, registry))
+}
+
+/// May this invocation ask `provider`? The chat route, judged by the same gate
+/// the backend itself applies before it sends.
+fn reachable(inv: &Invocation<'_>, provider: &OpenAiConfig) -> bool {
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+    url::Url::parse(&url).is_ok_and(|parsed| may_reach(inv, &parsed))
 }
 
 /// A no-match error that says what was asked and what was available.
@@ -1452,9 +1496,10 @@ impl SelectEndpoint {
 impl Endpoint for SelectEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let needs = inv.inline_str("needs")?;
+        // The grammar first: a malformed `needs=` costs no probe.
+        parse_needs(needs)?;
         let effective = effective_registry(&self.registry, &self.transport, inv).await;
-        let winner = select(&effective, &parse_needs(needs)?)
-            .ok_or_else(|| no_match_error("urn:llm:select", needs, &effective))?;
+        let winner = select_reachable(inv, &effective, needs, "urn:llm:select")?;
         let want_json = inv
             .inline_str("as")
             .map(|s| s.contains("json"))
@@ -1493,9 +1538,9 @@ impl Endpoint for SelectEndpoint {
         Description::new("llm-select")
             .summary(
                 "Capability-based selection: resolve `needs` (e.g. \"vision, ctx>=32k, \
-                 cost<=cheap\") over the declared trait profiles and return the winning \
-                 backend IRI. Policy: cheapest-that-fits, then smallest context, then \
-                 registry order.",
+                 cost<=cheap\") over the trait profiles of the backends this capability \
+                 can reach, and return the winning backend IRI. Policy: \
+                 cheapest-that-fits, then smallest context, then registry order.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -1521,6 +1566,10 @@ impl Endpoint for SelectEndpoint {
             )
             .output("text/plain;charset=utf-8")
             .output("application/json;charset=utf-8")
+            // Its answer is a backend the caller can REACH, so a capability with
+            // no net grant can never be answered: the floor states that up front
+            // (and its discovery probes are net-gated besides).
+            .requires(CAP_NET)
     }
 }
 
@@ -1542,7 +1591,7 @@ async fn post_json(
             body,
         })
         .await
-        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))
+        .map_err(|e| Error::Endpoint(scrub_userinfo(format!("llm transport error: {e}"), url)))
 }
 
 /// One installed model: its name and — where the provider reports it — its
@@ -1648,7 +1697,7 @@ async fn resolve_model(
             other => Error::Endpoint(format!(
                 "{who}: could not discover a model at `{}` — this provider declares no \
                  `model`, and listing the server's models failed: {other}",
-                config.base_url
+                redacted_url(&config.base_url)
             )),
         })?;
     models
@@ -1659,7 +1708,7 @@ async fn resolve_model(
             Error::Endpoint(format!(
                 "{who}: could not discover a model at `{}` — this provider declares no \
                  `model`, and the server listed no chat-capable model",
-                config.base_url
+                redacted_url(&config.base_url)
             ))
         })
 }
@@ -1698,7 +1747,7 @@ async fn installed_models(
         "models",
         &format!("urn:llm:{}:installed", config.provider),
     )?;
-    let response = get(transport, url).await?;
+    let response = get(transport, config, url).await?;
     if response.status >= 400 {
         return Err(Error::Endpoint(format!(
             "urn:llm:{}:installed: provider returned {}",
@@ -1742,11 +1791,10 @@ async fn annotate_capabilities(
     let Ok(parsed) = url::Url::parse(&url) else {
         return;
     };
-    let host = parsed.host_str().unwrap_or("");
-    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+    if !may_reach(inv, &parsed) {
         return;
     }
-    let headers = [("Content-Type".to_string(), "application/json".to_string())];
+    let headers = provider_headers(config, true);
     for m in models.iter_mut() {
         let Ok(response) = post_json(transport, &url, &headers, &json!({ "model": m.model })).await
         else {
@@ -1779,16 +1827,19 @@ async fn installed_via_tags(
         .trim_end_matches('/')
         .trim_end_matches("/v1");
     let url = format!("{root}/api/tags");
-    let parsed = url::Url::parse(&url)
-        .map_err(|e| Error::Endpoint(format!("llm: bad base_url `{}`: {e}", config.base_url)))?;
-    let host = parsed.host_str().unwrap_or("");
-    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
+    let parsed = url::Url::parse(&url).map_err(|e| {
+        Error::Endpoint(format!(
+            "llm: bad base_url `{}`: {e}",
+            redacted_url(&config.base_url)
+        ))
+    })?;
+    if !may_reach(inv, &parsed) {
         return Err(net_denied(
             &format!("urn:llm:{}:installed", config.provider),
-            host,
+            parsed.host_str().unwrap_or(""),
         ));
     }
-    let response = get(transport, url).await?;
+    let response = get(transport, config, url).await?;
     if response.status >= 400 {
         return Err(Error::Endpoint(format!(
             "llm: /api/tags returned {}",
@@ -1817,17 +1868,22 @@ async fn installed_via_tags(
         .unwrap_or_default())
 }
 
-/// A capability-checked-elsewhere GET, mapping transport failure to an error.
-async fn get(transport: &dyn HttpTransport, url: String) -> Result<HttpResponse> {
+/// A capability-checked-elsewhere GET to a provider, carrying its headers and
+/// mapping transport failure to an error (credentials scrubbed from it).
+async fn get(
+    transport: &dyn HttpTransport,
+    config: &OpenAiConfig,
+    url: String,
+) -> Result<HttpResponse> {
     transport
         .send(HttpRequest {
             method: Method::Get,
-            url,
-            headers: Vec::new(),
+            url: url.clone(),
+            headers: provider_headers(config, false),
             body: Vec::new(),
         })
         .await
-        .map_err(|e| Error::Endpoint(format!("llm transport error: {e}")))
+        .map_err(|e| Error::Endpoint(scrub_userinfo(format!("llm transport error: {e}"), &url)))
 }
 
 /// `urn:llm:<provider>:installed` — what the provider can actually serve right
@@ -1941,16 +1997,7 @@ impl Endpoint for UpEndpoint {
             "models",
             &format!("urn:llm:{}:up", self.config.provider),
         )?;
-        let alive = match self
-            .transport
-            .send(HttpRequest {
-                method: Method::Get,
-                url,
-                headers: Vec::new(),
-                body: Vec::new(),
-            })
-            .await
-        {
+        let alive = match get(self.transport.as_ref(), &self.config, url).await {
             Ok(response) => response.status < 400,
             Err(_) => false, // unreachable server = down, not an error
         };
@@ -1982,17 +2029,86 @@ impl Endpoint for UpEndpoint {
 }
 
 /// Gate an outbound call by the per-host net capability and return the full URL:
-/// `{base_url}/{path}` checked via [`ikigai_http::net_allows`]. Shared by every
-/// endpoint here that touches the provider.
+/// `{base_url}/{path}` checked via [`may_reach`]. Shared by every endpoint here
+/// that touches the provider.
 fn require_net(inv: &Invocation<'_>, base_url: &str, path: &str, who: &str) -> Result<String> {
     let url = format!("{}/{path}", base_url.trim_end_matches('/'));
-    let parsed = url::Url::parse(&url)
-        .map_err(|e| Error::Endpoint(format!("{who}: bad base_url `{base_url}`: {e}")))?;
-    let host = parsed.host_str().unwrap_or("");
-    if !ikigai_http::net_allows(inv.capability, host, parsed.path()) {
-        return Err(net_denied(who, host));
+    let parsed = url::Url::parse(&url).map_err(|e| {
+        Error::Endpoint(format!(
+            "{who}: bad base_url `{}`: {e}",
+            redacted_url(base_url)
+        ))
+    })?;
+    if !may_reach(inv, &parsed) {
+        return Err(net_denied(who, parsed.host_str().unwrap_or("")));
     }
     Ok(url)
+}
+
+/// Does this invocation's capability reach `url`? Host, **port** and path, judged
+/// exactly the way ikigai-http's own endpoints judge them: with the URL's real
+/// port, or its scheme's default when it names none. The port-less
+/// `net_allows` treats the port as unknown, so a grant scoped to one port
+/// (`urn:cap:net:localhost:8000`) would reach every other port on that host and a
+/// deny on one port would refuse them all. Every gate in this crate goes through
+/// here; there is no second spelling to drift.
+fn may_reach(inv: &Invocation<'_>, url: &url::Url) -> bool {
+    ikigai_http::net_allows_port(
+        inv.capability,
+        url.host_str().unwrap_or(""),
+        url.port_or_known_default(),
+        url.path(),
+    )
+}
+
+/// The headers every request to a provider carries: the bearer key when the
+/// provider has one, and a JSON content type when there is a body. One place
+/// builds them, so a route that forgets the key cannot exist — before it did,
+/// the chat call sent the key while the listing, liveness and `/api/show` calls
+/// sent nothing, so a keyed provider read as down and a keyed discovering
+/// provider could not answer at all.
+fn provider_headers(config: &OpenAiConfig, json_body: bool) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if json_body {
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    }
+    if let Some(key) = &config.api_key {
+        headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+    }
+    headers
+}
+
+/// The `user:password` part of a URL's authority, if it has one — taken from the
+/// text, not a parse, so it matches the spelling a transport echoes back and
+/// works on a URL too malformed to parse.
+fn userinfo(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.rsplit_once('@').map(|(info, _)| info)
+}
+
+/// A `base_url` fit to show: its userinfo removed. A basic-auth reverse proxy
+/// takes its credentials in the URL (`https://user:pass@host/v1`), and
+/// `urn:llm:config` answers under no capability at all — so every face and every
+/// error that names a `base_url` names this instead. A URL without userinfo
+/// comes back verbatim.
+fn redacted_url(url: &str) -> String {
+    match userinfo(url) {
+        Some(info) => url.replacen(&format!("{info}@"), "", 1),
+        None => url.to_string(),
+    }
+}
+
+/// `text` with `url`'s userinfo removed wherever it appears — for an error a
+/// transport composed, which may quote the URL it was handed (ureq's do).
+fn scrub_userinfo(text: String, url: &str) -> String {
+    match userinfo(url) {
+        Some(info) if !info.is_empty() => text.replace(&format!("{info}@"), ""),
+        _ => text,
+    }
 }
 
 /// The per-host refusal: a typed, permanent [`Error::Denied`] — the same error

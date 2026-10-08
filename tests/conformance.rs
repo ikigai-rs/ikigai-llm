@@ -47,7 +47,8 @@
 //!   grants (the KERNEL's floor refuses on the declared `urn:cap:net:*`) and a
 //!   grant on ANOTHER host (the wildcard admits the call and the module's own
 //!   per-host rule refuses — typed `Denied` too, for every action, the facade
-//!   and a discovering `:model` included).
+//!   and a discovering `:model` included). Selection is refused the same two
+//!   ways: it answers only with a backend the caller can reach.
 //! - **An answer is never cacheable** ([`answers_are_live_by_construction`],
 //!   PENDING #22/#64): generation is non-deterministic, so `:ask` is live;
 //!   liveness and a discovered identity are live facts. The suite's cache probe
@@ -66,8 +67,9 @@
 //!   still contributes only the message.
 //! - **The manifold states the contract**
 //!   ([`the_manifold_states_the_contract`]): every input has a class, every
-//!   action that reaches the network declares exactly `urn:cap:net:*` and the
-//!   config reads declare nothing, only `prompt` / `needs` are required (no
+//!   action that reaches the network, and selection, declares exactly
+//!   `urn:cap:net:*` and the config reads declare nothing, only `prompt` /
+//!   `needs` are required (no
 //!   check can see "required but actually optional", PENDING #5/#49).
 
 use async_trait::async_trait;
@@ -499,13 +501,14 @@ const NETWORK_ACTIONS: [&str; 8] = [
     "urn:llm:server:model",
 ];
 
-/// The config reads: no network, no capability.
-const CONFIG_READS: [&str; 4] = [
-    "urn:llm:config",
-    "urn:llm:models",
-    "urn:llm:select",
-    "urn:llm:ollama:model",
-];
+/// The config reads: no capability. (`urn:llm:models` fills gaps from a
+/// backend's discovery where the caller's grant reaches it, and otherwise
+/// answers from the declared profile without opening a socket.)
+const CONFIG_READS: [&str; 3] = ["urn:llm:config", "urn:llm:models", "urn:llm:ollama:model"];
+
+/// Selection: config-derived, but its answer is a backend the caller can
+/// REACH, so it declares the net wildcard and is refused without a grant.
+const SELECT: &str = "urn:llm:select";
 
 /// Under no grants — and under a grant on another host — every network action
 /// refuses with a typed, permanent `Denied`, and the stub accepts no
@@ -533,10 +536,17 @@ fn every_network_action_is_denied_before_any_socket_opens() {
                 "{iri}: the denial names what refused it: {err}"
             );
         }
+        // Selection is refused too, and names no backend: under no grants by
+        // the kernel's floor, under a grant on another host because no backend
+        // the capability can reach satisfies the requirement.
+        let err = issue(&kernel, SELECT, &[("needs", "cost=local")], &capability)
+            .err()
+            .unwrap_or_else(|| panic!("{SELECT} resolved under {capability:?}"));
+        assert!(matches!(err, Error::Denied(_)), "{SELECT}: {err:?}");
+        assert!(!err.is_transient(), "{SELECT}: {err:?}");
         // The config reads are not gated: they answer under no grants at all.
         for iri in CONFIG_READS {
-            issue(&kernel, iri, &[("needs", "cost=local")], &capability)
-                .unwrap_or_else(|e| panic!("{iri}: {e}"));
+            issue(&kernel, iri, &[], &capability).unwrap_or_else(|e| panic!("{iri}: {e}"));
         }
     }
     assert_eq!(
@@ -595,6 +605,7 @@ fn config_derived_results_are_cut_by_the_registry_thread() {
     let root = Capability::root();
     let requests: Vec<Request> = CONFIG_READS
         .iter()
+        .chain([SELECT].iter())
         .map(|iri| request(Verb::Source, iri, &[("needs", "cost=local")]))
         .collect();
     for req in &requests {
@@ -768,20 +779,24 @@ fn a_prompt_never_appears_in_the_errors_this_module_composes() {
 }
 
 /// The contract as the manifold states it: one Source action per endpoint,
-/// every input has a class, every network action declares exactly the net
-/// wildcard and every config read declares nothing, and only `prompt` (the
-/// asks) and `needs` (selection) are required.
+/// every input has a class, every network action and selection declare
+/// exactly the net wildcard and every config read declares nothing, and only
+/// `prompt` (the asks) and `needs` (selection) are required.
 #[test]
 fn the_manifold_states_the_contract() {
     let stub = Stub::start();
     let kernel = kernel(discovering(&stub));
-    for iri in NETWORK_ACTIONS.iter().chain(CONFIG_READS.iter()) {
+    for iri in NETWORK_ACTIONS
+        .iter()
+        .chain(CONFIG_READS.iter())
+        .chain([SELECT].iter())
+    {
         let description = kernel.describe_pattern(iri).unwrap();
         let specs = description.action_specs();
         assert_eq!(specs.len(), 1, "{iri}: one action");
         let spec = &specs[0];
         assert_eq!(spec.verb, Verb::Source, "{iri}");
-        let expected: &[&str] = if NETWORK_ACTIONS.contains(iri) {
+        let expected: &[&str] = if NETWORK_ACTIONS.contains(iri) || *iri == SELECT {
             &[NET_WILDCARD]
         } else {
             &[]
