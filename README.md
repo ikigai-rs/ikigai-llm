@@ -29,7 +29,14 @@ config-derived result is cut by one golden thread, `urn:llm:config`.
 ### Inputs
 `prompt` (or piped `content`) · `model` · `system` · `temperature` · `max_tokens`
 · `as` (`application/json` for a `{text, model, usage}` envelope; default
-`text/plain`) · `provider` (facade only).
+`text/plain`) · `provider` and `needs` (facade only).
+
+An optional input is either absent or used: one supplied in a form the endpoint
+cannot read (a reference, interned content, non-UTF-8 bytes) is refused, never
+treated as absent — on the facade, absent means "the default", and a `needs=`
+policy it could not read must not route there. `temperature` must be a finite
+number and `max_tokens` a positive integer, or the ask is refused before any
+request is sent.
 
 ### Mounting it
 The host injects an [`ikigai_http::HttpTransport`] (the same seam `ikigai-http`
@@ -123,7 +130,10 @@ has no field to put it in, and a provider that declared no vendor still fails th
 exclusion. (This README used to call that group *governance* as if it meant "not
 routed on"; it never did. The word names the provenance, not the use.)
 
-Declared values always win; discovery fills only gaps. **`urn:llm:models`**
+Declared values always win; discovery fills only gaps. `modalities` is a set,
+so there filling gaps is a union: discovery adds a modality the declaration did
+not list, and a declaration or annotation adds one the server under-reports.
+**`urn:llm:models`**
 is the annotated inventory: JSON by default, and `as=text/turtle` renders the
 **queryable trait graph** (`ik:LlmBackend` · `ik:model` · `ik:context` ·
 `ik:modality` · `ik:tools` · `ik:cost` · `ik:vendor` · `ik:batchAt`), so "a
@@ -148,7 +158,8 @@ Trait facts arrive at three strengths — **annotations > declared > discovered*
   from an alignment/annotation graph (subjects are the trait-graph's own
   `urn:llm:<name>:ask` IRIs, or bare provider names) and **completes or corrects**
   under-specified descriptions — an override is never silent: every conflict is
-  returned for the host to log. `modality` facts union in. So a config that
+  returned for the host to log. `modality` facts union in, and keep whatever
+  discovery finds beside them. So a config that
   forgot `vendor` on a remote can be fixed from the graph, and `vendor!=openai`
   then correctly excludes it instead of conservatively failing everything.
 
@@ -235,7 +246,9 @@ guess — no OpenAI-compatible endpoint advertises whether it batches. So:
 - a **server** cannot assert one — the discovered profile has no field for it;
 - an **annotation graph** can (`ik:batchAt`), because it is operator-authored;
 - `batchAt: 0` and a non-numeric value **fail the config load**, naming the
-  provider, rather than defaulting to absent.
+  provider, rather than defaulting to absent — as do a mistyped key
+  (`batchat`), a `cost` outside the three tiers, and a `default` that names no
+  configured provider.
 
 Omitting the term routes exactly as it did before the trait existed.
 
@@ -252,10 +265,13 @@ accident of list order.
 
 And the backend resolves defaults against it: if a request **didn't name**
 `model=` and the configured default 404s (the demo moved machines; the model
-was never pulled), it lists what's installed and **retries once with the first
-available model**. An explicit `model=` is *never* substituted — that errors
-honestly. So a host's default config degrades to "use what's here" instead of
-failing on a hardcoded name.
+was never pulled), it lists what's installed and **retries once with the
+smallest model the server says can chat** — Ollama's `/api/show` reports
+`completion`. A substitution the caller did not ask for needs that evidence: a
+listing that says nothing about capabilities (the OpenAI-compat `/models`) could
+put an embedder first, so there the 404 surfaces instead. An explicit `model=`
+is *never* substituted — that errors honestly. So an Ollama host's default
+config degrades to "use what's here" instead of failing on a hardcoded name.
 
 ## Model identity: `urn:llm:<provider>:model`
 The model id serving this provider, as `text/plain` — e.g.
@@ -330,6 +346,40 @@ Fixes from the unled audit of 0.12.2 (ledger #884), each pinned by a test in
   kernel's floor instead of being told about backends it cannot use.
   `urn:llm:models` still needs no capability: it probes only hosts the caller's
   grant reaches and otherwise reports the declared profile.
+- **The config refuses what it used to load and misroute on**: an unknown key at
+  any level (`Caps` now denies unknown fields wherever it is deserialized), a
+  `cost` outside `local` | `cheap` | `premium`, and a `default` that names no
+  provider.
+- **Inputs are refused rather than dropped**: an unreadable `needs=` or
+  `provider=` on the facade (it used to route to the default — the very vendor a
+  `vendor!=` policy excluded), an unreadable `model`, `system` or `supports`, a
+  `temperature` that is not a finite number (NaN was sent as JSON `null`), and a
+  `max_tokens` that is not a positive integer.
+- `ctx>=Nk` beyond 64 bits is a grammar error; it panicked in debug builds and
+  wrapped in release, selecting a 128k backend for a requirement nothing meets.
+- The Turtle face escapes LF and CR, so a server-reported model id or modality
+  with a line break no longer makes the trait graph unparseable.
+- The trace labels the model that **answered**, not the configured one that
+  404'd before the fallback.
+- An error body contributes only its stated reason (`error.message`, a
+  `message`/`detail` string, FastAPI's `detail[].msg`), or its field names when
+  it has none of those; the prompt and system prompt are cut from it wherever a
+  server echoed them. FastAPI's 422 used to put the prompt in the error.
+- An annotated `modality` keeps the discovered ones beside it.
+- The 404 default-model fallback substitutes only a model the server says can
+  chat; on the OpenAI-compat path, which says nothing, it no longer retries
+  with whatever is listed first.
+
+**Version: 0.13.0 (minor), not 0.12.3.** A registry that loaded under 0.12.2 can
+now be refused (the three load checks above, and `Caps` deserialization
+generally), requests 0.12.2 answered are now refused, and `urn:llm:select`
+refuses a caller with no net grant. Under 0.x caret rules a patch reaches every
+`^0.12` consumer on a plain `cargo update`, and ikigai-cli falls back to its
+built-in single-Ollama registry when `llm.json` fails to parse — so a config
+refusal arriving unasked would silently reroute a host. A minor makes each
+consumer (ikigai-cli and ikigai-dev-server pin `0.12.1`, ikigai-cms-web `0.12`)
+opt in with a manifest edit, which is the moment to check its `llm.json` loads.
+The cost is that the security fixes reach no consumer until that edit.
 
 ## Design & roadmap
 The facade is the imperative seed of the interception/rewrite primitive: a static
