@@ -8,10 +8,11 @@
 //! answers the way the named server does (Ollama, an OpenAI-shaped API) and logs
 //! every request it is sent, so a test can prove what was — and was not — asked.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Request, Verb};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_llm::{space, Registry};
 
@@ -180,6 +181,59 @@ fn discovery_and_listing_honor_the_port() {
         stub.urls().is_empty(),
         "a grant on :8000 reached :11434: {:?}",
         stub.urls()
+    );
+}
+
+// ---- serious 2: a pinned ollama provider's live answers were cached forever -----
+
+const OLLAMA_AND_PREMIUM: &str = r#"{ "default": "o", "providers": {
+    "o": { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b",
+           "caps": { "vendor": "ollama", "cost": "local" } },
+    "p": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "k",
+           "caps": { "vendor": "openai", "cost": "premium", "tools": true } } } }"#;
+
+fn show_stub(up: Arc<AtomicBool>) -> Arc<Stub> {
+    Stub::new(move |r| {
+        if r.url.ends_with("/api/show") {
+            if up.load(Ordering::SeqCst) {
+                reply(200, r#"{"capabilities":["completion","tools"]}"#)
+            } else {
+                Err("connection refused".to_string())
+            }
+        } else {
+            reply(404, "{}")
+        }
+    })
+}
+
+/// `urn:llm:select` for a pinned `vendor: "ollama"` provider probes `/api/show`
+/// on every resolve, so its answer is a live fact. A selection taken while Ollama
+/// was briefly down must not be served after it comes back (Claude r2, Hermes
+/// bug2).
+#[test]
+fn a_select_taken_while_ollama_was_down_is_not_served_after_it_returns() {
+    let up = Arc::new(AtomicBool::new(false));
+    let k = kernel(show_stub(up.clone()), registry(OLLAMA_AND_PREMIUM));
+    let r = req("urn:llm:select", &[("needs", "tools")]);
+
+    let first = root(&k, r.clone()).unwrap();
+    assert_eq!(
+        text(&first),
+        "urn:llm:p:ask",
+        "while /api/show is down only p declares tools"
+    );
+    assert_ne!(
+        first.expiry,
+        Expiry::Never,
+        "a network-fed answer is not permanent"
+    );
+
+    up.store(true, Ordering::SeqCst);
+    let second = root(&k, r).unwrap();
+    assert_eq!(
+        text(&second),
+        "urn:llm:o:ask",
+        "the outage's selection was served from cache"
     );
 }
 

@@ -282,8 +282,13 @@ It is uncacheable on purpose: caching a discovered id restores the staleness
 discovery exists to remove, and a cached representation reached through a mount
 can never be invalidated.
 
-The same rule governs `urn:llm:models` and `urn:llm:select`: cacheable while
-every provider is pinned, uncacheable once any provider discovers.
+`urn:llm:models` and `urn:llm:select` follow one rule: **cacheable exactly when
+answering asked no server anything.** A provider that names only its server
+asks for its model list, and a declared `vendor: "ollama"` opts into a live
+`/api/show` on every resolve, so either makes the answer a live fact — even with
+every model pinned. Whether a server was asked is recorded at the transport, and
+a probe the caller's capability could not make leaves the answer a function of
+config and capability, cacheable under `urn:llm:config`.
 
 ## Liveness: `urn:llm:<provider>:up`
 A boolean resource — `true` if the provider answers a cheap `GET {base_url}/models`,
@@ -310,6 +315,16 @@ Fixes from the unled audit of 0.12.2 (ledger #884), each pinned by a test in
 - **URL credentials are redacted** from `urn:llm:config`, `urn:llm:models` and
   every composed error (a transport's own error text included).
 - **The API key is sent on every request** to its provider, not only on chat.
+- **An inventory or selection built from a live probe is no longer cached for
+  ever.** A pinned `vendor: "ollama"` provider still probes `/api/show` on every
+  resolve, yet `urn:llm:models` and `urn:llm:select` were marked permanent, so a
+  selection taken while Ollama was down was served until restart. They are now
+  uncacheable whenever building them asked a server. The cost, measured on a
+  three-provider registry with two `vendor: "ollama"` entries (stub transport,
+  release build): a repeat `urn:llm:select` read went from a ~0.6µs cache hit to
+  ~6.7µs with a zero-latency transport and ~2.5ms with a 1ms `/api/show` — one
+  round trip per declared-ollama provider, which the facade's `needs=` already
+  paid on every ask. A registry that opts into no discovery caches as before.
 - **`urn:llm:select` answers only with a backend the caller can reach**, and
   declares `urn:cap:net:*`; a caller holding no net grant is refused by the
   kernel's floor instead of being told about backends it cannot use.
