@@ -13,7 +13,10 @@ addressable (`urn:llm:<provider>:ask`).
   and LM Studio** — they differ only in `base_url`, `default_model`, and whether a
   key is needed.
 
-Buffered (no streaming yet), single-turn, `urn:cap:net`-gated. Generation is
+Buffered (no streaming yet), single-turn, `urn:cap:net`-gated. The gate judges
+host, **port** and path exactly as `ikigai-http`'s own endpoints do: a grant on
+`urn:cap:net:localhost:8000` reaches the MLX server on 8000 and not Ollama on
+11434, and a deny on one port refuses only that port. Generation is
 non-deterministic, so results are uncacheable by default.
 
 Passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance):
@@ -45,8 +48,9 @@ let kernel = ikigai_core::Kernel::new(Arc::new(space));
 `space()` takes a **`Registry`** — several providers plus a default — and binds
 one `urn:llm:<name>:ask` backend for each (all catalog-advertised), the
 `urn:llm:ask` facade (routing to the default), and **`urn:llm:config`** (a
-resource reporting the effective registry, **API keys redacted**). A single
-`OpenAiConfig` still works via `From<OpenAiConfig>`.
+resource reporting the effective registry, **API keys redacted** and any
+`user:password@` removed from a `base_url` — it answers under no capability at
+all). A single `OpenAiConfig` still works via `From<OpenAiConfig>`.
 
 The registry is compiled defaults ⊕ an optional hand-editable JSON file (the
 load-time form of "the logical config aliases to file-or-code"):
@@ -91,7 +95,13 @@ let space = ikigai_llm::space(Arc::new(my_transport), registry);
 // urn:llm:ask -> fast · urn:llm:big:ask -> the 70B · source urn:llm:config -> the registry
 ```
 
-`source urn:llm:config` shows the loaded registry with keys masked as `***`.
+`source urn:llm:config` shows the loaded registry with keys masked as `***` and
+URL credentials removed (`https://user:pass@proxy/v1` reads `https://proxy/v1`);
+`urn:llm:models` and every error that names a `base_url` show the same redacted
+form. Those are the only secret-bearing fields an entry has. The key is sent on
+**every** request to its provider — chat, the model listing, liveness, and
+Ollama's native `/api/tags` and `/api/show` — so a keyed provider is not reported
+down, and a keyed provider that names only its server can discover its model.
 
 ## Capability profiles & `urn:llm:models`
 Each provider may declare a **`caps`** profile — `context` (tokens), `modalities`
@@ -159,6 +169,13 @@ in caps, e.g. `ollama`/`openai`/`anthropic`, and `vendor!=openai` means *this
 prompt never goes to OpenAI*) · `provider=name` / `provider!=name` (registry
 entries by your local names) · **`batchAt<=N`** (load shape — see the next
 section).
+
+Selection reasons only over the backends **the caller's capability can reach**:
+a backend you could not ask is not an answer, and naming one would hand you the
+identity of a backend your grant withholds. So `urn:llm:select` declares
+`urn:cap:net:*` (with no net grant it can never answer), the facade's `needs=`
+routes to a reachable backend, and when only unreachable backends satisfy the
+requirement the refusal is a typed `Denied` that names none of them.
 
 Unknown terms **error** (a typo must not mis-select); a trait a provider didn't
 declare can't satisfy a requirement on it — **including `vendor!=`**: an
@@ -278,6 +295,26 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
+
+## Unreleased
+
+Fixes from the unled audit of 0.12.2 (ledger #884), each pinned by a test in
+`tests/audit.rs` that failed on 0.12.2:
+
+- **Port-scoped net grants are enforced.** Every gate called the port-less
+  `ikigai_http::net_allows`, which treats the port as unknown, so
+  `urn:cap:net:localhost:8000` reached Ollama on 11434 and a deny on one port
+  refused every port. They now call `net_allows_port` with the URL's real (or
+  scheme-default) port. The `ikigai-http` floor moves to 0.1.7, the first
+  release with `net_allows_port`.
+- **URL credentials are redacted** from `urn:llm:config`, `urn:llm:models` and
+  every composed error (a transport's own error text included).
+- **The API key is sent on every request** to its provider, not only on chat.
+- **`urn:llm:select` answers only with a backend the caller can reach**, and
+  declares `urn:cap:net:*`; a caller holding no net grant is refused by the
+  kernel's floor instead of being told about backends it cannot use.
+  `urn:llm:models` still needs no capability: it probes only hosts the caller's
+  grant reaches and otherwise reports the declared profile.
 
 ## Design & roadmap
 The facade is the imperative seed of the interception/rewrite primitive: a static
