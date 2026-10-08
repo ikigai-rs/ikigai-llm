@@ -317,7 +317,7 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
-## Unreleased
+## 0.13.0 (2026-10-08)
 
 Fixes from the unled audit of 0.12.2 (ledger #884), each pinned by a test in
 `tests/audit.rs` that failed on 0.12.2:
