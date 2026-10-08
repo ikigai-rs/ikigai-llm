@@ -17,14 +17,22 @@
 //!
 //! ## Two registries, two walks
 //!
-//! The registry decides what is cacheable, so the suite walks two of them:
+//! The registry decides what is cacheable, so the suite walks three of them.
+//! The rule is one sentence: a config-derived answer is cacheable exactly when
+//! building it asked no server anything (ledger #884).
 //!
-//! - [`conforms`] walks a **pinned** registry (one `ollama` provider naming its
-//!   model) and declares `llm-config`, `llm-models`, `llm-select` and
-//!   `llm-ollama-model` `cacheable`: each is a function of the registry, held
-//!   to a cache hit on the second resolution and to a non-empty thread set —
-//!   `urn:llm:config`, the registry's golden thread, which
+//! - [`conforms_without_discovery`] walks a **quiet** registry: one provider
+//!   naming its model and declaring a vendor that opts into no discovery. It
+//!   declares `llm-config`, `llm-models`, `llm-select` and `llm-ollama-model`
+//!   `cacheable`: each is a function of the registry, held to a cache hit on the
+//!   second resolution and to a non-empty thread set — `urn:llm:config`, the
+//!   registry's golden thread, which
 //!   [`config_derived_results_are_cut_by_the_registry_thread`] cuts by hand.
+//! - [`conforms`] walks a **pinned** registry whose provider declares
+//!   `vendor: "ollama"`, the opt-in to a live `/api/show` probe. The inventory
+//!   and selection ask that server on every resolve, so only `llm-config` and
+//!   `llm-ollama-model` are cacheable there
+//!   ([`answers_that_asked_a_server_are_live`]).
 //! - [`conforms_with_a_discovering_provider`] adds a provider that names only
 //!   its **server**. Its `:model` probes the backend (so it declares the net
 //!   capability and is live), and one discovering provider makes the inventory
@@ -341,6 +349,14 @@ fn pinned(stub: &Stub) -> Registry {
     Registry::single(ollama(stub, "/v1"))
 }
 
+/// The pinned registry with a vendor that opts into no discovery: nothing it
+/// answers from config asks a server anything.
+fn quiet(stub: &Stub) -> Registry {
+    let mut registry = pinned(stub);
+    registry.providers[0].caps.vendor = Some("mlx".to_string());
+    registry
+}
+
 /// The pinned registry plus a `server` provider that names only its server:
 /// the model is discovered from `GET /v1/models` per resolve.
 fn discovering(stub: &Stub) -> Registry {
@@ -413,14 +429,14 @@ fn assert_stub_footprint(stub: &Stub, asks: usize) {
 }
 
 #[test]
-fn conforms() {
+fn conforms_without_discovery() {
     let stub = Stub::start();
     let report = suite()
         .cacheable("llm-config")
         .cacheable("llm-models")
         .cacheable("llm-select")
         .cacheable("llm-ollama-model")
-        .run_blocking(&kernel(pinned(&stub)));
+        .run_blocking(&kernel(quiet(&stub)));
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -428,6 +444,25 @@ fn conforms() {
     assert_eq!(
         report.declared.cacheable,
         ["llm-config", "llm-models", "llm-select", "llm-ollama-model"],
+        "{report}"
+    );
+    assert_stub_footprint(&stub, 2);
+    assert_eq!(stub.hits("/api/show"), 0, "nothing opted into discovery");
+}
+
+#[test]
+fn conforms() {
+    let stub = Stub::start();
+    let report = suite()
+        .cacheable("llm-config")
+        .cacheable("llm-ollama-model")
+        .run_blocking(&kernel(pinned(&stub)));
+    eprintln!("{report}");
+    assert!(report.is_clean(), "{report}");
+    assert_shape(&report, 1);
+    assert_eq!(
+        report.declared.cacheable,
+        ["llm-config", "llm-ollama-model"],
         "{report}"
     );
     assert_stub_footprint(&stub, 2);
@@ -598,10 +633,14 @@ fn answers_are_live_by_construction() {
 /// Every config-derived result is cacheable under the registry's one thread,
 /// `urn:llm:config`, and cutting it evicts all of them — the hook a live
 /// reload will use, and the thread a copy cached across a mount can be cut by.
+/// Walked over the quiet registry: until ledger #884 this ran over the pinned
+/// one and asserted that an inventory and a selection built from a live
+/// `/api/show` probe were cached for ever, which is the defect
+/// [`answers_that_asked_a_server_are_live`] now pins the other way.
 #[test]
 fn config_derived_results_are_cut_by_the_registry_thread() {
     let stub = Stub::start();
-    let kernel = kernel(pinned(&stub));
+    let kernel = kernel(quiet(&stub));
     let root = Capability::root();
     let requests: Vec<Request> = CONFIG_READS
         .iter()
@@ -635,6 +674,39 @@ fn config_derived_results_are_cut_by_the_registry_thread() {
             "{}: one cut evicts every config-derived result",
             req.target
         );
+    }
+}
+
+/// An inventory or a selection whose building asked a server — here Ollama's
+/// `/api/show`, which a declared `vendor: "ollama"` opts into — is a live fact:
+/// two resolutions, two probes, no thread, nothing cached. Before ledger #884 it
+/// was marked permanent under the registry thread, so a selection taken while
+/// Ollama was down was served until restart.
+#[test]
+fn answers_that_asked_a_server_are_live() {
+    let stub = Stub::start();
+    let kernel = kernel(pinned(&stub));
+    let root = Capability::root();
+    for (iri, args) in [
+        ("urn:llm:models", vec![]),
+        ("urn:llm:models", vec![("as", "text/turtle")]),
+        (SELECT, vec![("needs", "cost=local")]),
+    ] {
+        let before = stub.hits("/api/show");
+        for _ in 0..2 {
+            let repr = issue(&kernel, iri, &args, &root).unwrap_or_else(|e| panic!("{iri}: {e}"));
+            assert_eq!(repr.expiry, Expiry::Always, "{iri} {args:?} is live");
+            assert!(
+                repr.threads().is_empty(),
+                "{iri}: a live fact names no thread"
+            );
+        }
+        assert_eq!(
+            stub.hits("/api/show"),
+            before + 2,
+            "{iri} {args:?}: two resolutions, two probes"
+        );
+        assert!(!kernel.is_cached(&request(Verb::Source, iri, &args), &root));
     }
 }
 

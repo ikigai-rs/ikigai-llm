@@ -23,6 +23,7 @@
 //! are uncacheable by default (deterministic caching is a later slice).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -44,8 +45,9 @@ use serde_json::{json, Value};
 const CAP_NET: &str = "urn:cap:net:*";
 
 /// The golden thread every **config-derived** cacheable representation depends
-/// on — `urn:llm:config` itself, `urn:llm:models`, `urn:llm:select`, and a
-/// pinned provider's `urn:llm:<provider>:model`. The registry is read once at
+/// on — `urn:llm:config` itself, a pinned provider's `urn:llm:<provider>:model`,
+/// and `urn:llm:models` and `urn:llm:select` when answering them asked no
+/// server anything. The registry is read once at
 /// kernel construction, so today nothing cuts it and a restart is the only
 /// reload; naming the thread is what makes those results cuttable at all. A
 /// host that grows live reload cuts ONE thread (`Kernel::cut("urn:llm:config")`,
@@ -504,7 +506,7 @@ impl Endpoint for AskFacade {
             name.to_string()
         } else if let Ok(needs) = inv.inline_str("needs") {
             parse_needs(needs)?;
-            let effective = effective_registry(&self.registry, &self.transport, inv).await;
+            let (effective, _) = effective_registry(&self.registry, &self.transport, inv).await;
             select_reachable(inv, &effective, needs, "urn:llm:ask")?
                 .provider
                 .clone()
@@ -946,7 +948,10 @@ impl Endpoint for ModelEndpoint {
 /// model and declared [`Caps`], as JSON (default) or Turtle (`as=text/turtle`).
 /// The Turtle face is the queryable trait graph — SPARQL over it is how
 /// capability-based selection ("a vision model with ≥32k context") will resolve.
-/// Config-derived, so cacheable until the registry changes (a restart, for now).
+/// Cacheable until the registry changes (a restart, for now) when it is
+/// config-derived; a live fact, uncacheable, when building it asked a server —
+/// see the private
+/// `effective_registry`.
 pub struct ModelsEndpoint {
     registry: Registry,
     transport: Arc<dyn HttpTransport>,
@@ -1065,7 +1070,7 @@ impl Endpoint for ModelsEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // The inventory is declared ⊕ discovered — gaps filled live from the
         // provider (Ollama /api/show) where declared vendor + capability allow.
-        let effective = effective_registry(&self.registry, &self.transport, inv).await;
+        let (effective, probed) = effective_registry(&self.registry, &self.transport, inv).await;
         let want_turtle = inv
             .inline_str("as")
             .map(|s| s.contains("turtle"))
@@ -1080,7 +1085,7 @@ impl Endpoint for ModelsEndpoint {
         };
         Ok(with_cacheability(
             Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes),
-            &self.registry,
+            probed,
         ))
     }
 
@@ -1206,11 +1211,25 @@ fn merge_declared_wins(declared: &Caps, discovered: Caps) -> Caps {
 /// This invocation's view of the registry: every provider's declared profile
 /// with discovered gaps filled. What `urn:llm:models` reports and selection
 /// reasons over.
+///
+/// The second half of the answer says whether building it **asked a server
+/// anything** — a model listing for a provider that names only its server, or
+/// Ollama's `/api/show` for a declared `vendor: "ollama"` — whether or not the
+/// server answered. Either way the result is then a live fact (a probe that
+/// FAILED is the sharpest case: an outage's answer must not outlive the
+/// outage). Recorded at the transport, so a new discovery route cannot forget
+/// to say so; a probe the capability gate refused never reached it and leaves
+/// the result a function of config and capability alone.
 async fn effective_registry(
     registry: &Registry,
     transport: &Arc<dyn HttpTransport>,
     inv: &Invocation<'_>,
-) -> Registry {
+) -> (Registry, bool) {
+    let probing = Probing {
+        inner: transport.as_ref(),
+        sent: AtomicBool::new(false),
+    };
+    let transport: &dyn HttpTransport = &probing;
     let mut effective = registry.clone();
     for provider in &mut effective.providers {
         // A provider that named only the SERVER: ask the server what it serves.
@@ -1221,7 +1240,7 @@ async fn effective_registry(
         // are where an unreachable backend fails loudly, and they must.
         if provider.default_model.is_none() {
             if let Ok((model, advertised)) =
-                resolve_model(transport.as_ref(), inv, provider, "urn:llm:models").await
+                resolve_model(transport, inv, provider, "urn:llm:models").await
             {
                 provider.default_model = Some(model);
                 if let Some(found) = advertised {
@@ -1229,26 +1248,35 @@ async fn effective_registry(
                 }
             }
         }
-        if let Some(found) = discovered_caps(transport.as_ref(), inv, provider).await {
+        if let Some(found) = discovered_caps(transport, inv, provider).await {
             provider.caps = merge_declared_wins(&provider.caps, found);
         }
     }
-    effective
+    (effective, probing.sent.load(Ordering::Relaxed))
 }
 
-/// Does any provider name only its server? Then this invocation had to ask the
-/// network what the answer is, and the result is a **live fact** — cacheing it
-/// would restore exactly the staleness discovery exists to remove (and a cached
-/// representation reached through a mount can never be invalidated at all).
-/// A registry of pinned providers is unaffected: config in, cacheable out.
-fn any_discovering(registry: &Registry) -> bool {
-    registry.providers.iter().any(|p| p.default_model.is_none())
+/// A transport that remembers whether anything went through it.
+struct Probing<'a> {
+    inner: &'a dyn HttpTransport,
+    sent: AtomicBool,
+}
+
+#[async_trait]
+impl HttpTransport for Probing<'_> {
+    async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+        self.sent.store(true, Ordering::Relaxed);
+        self.inner.send(request).await
+    }
 }
 
 /// Mark a config-derived representation cacheable, under the registry's thread
-/// — unless discovery fed it.
-fn with_cacheability(repr: Representation, registry: &Registry) -> Representation {
-    if any_discovering(registry) {
+/// — unless a server was asked for any part of it. A live fact cached would
+/// restore exactly the staleness discovery exists to remove: a selection taken
+/// while Ollama was down would be served until restart, and a copy cached on
+/// the far side of a mount could never be invalidated at all. Nothing cuts a
+/// thread when a server's answer changes, so there is no thread to hang it on.
+fn with_cacheability(repr: Representation, probed: bool) -> Representation {
+    if probed {
         repr
     } else {
         repr.cacheable().depends_on(CONFIG_THREAD)
@@ -1475,7 +1503,9 @@ fn no_match_error(who: &str, needs: &str, registry: &Registry) -> Error {
 /// `urn:llm:select` — deterministic capability-based selection: resolve a
 /// `needs=` expression over the declared trait profiles and return the winning
 /// backend's IRI (`text/plain`, pipeable) or its detail (`as=application/json`).
-/// Selection is a pure function of the registry, so the result is cacheable.
+/// Selection over the declared profiles is a function of the registry and the
+/// capability, so it is cacheable; once discovery asked a server, it is a live
+/// fact and is not.
 /// (The SPARQL power path is composition, not a dep: `urn:llm:models
 /// as=text/turtle` is the same trait data as a queryable graph.)
 pub struct SelectEndpoint {
@@ -1498,7 +1528,7 @@ impl Endpoint for SelectEndpoint {
         let needs = inv.inline_str("needs")?;
         // The grammar first: a malformed `needs=` costs no probe.
         parse_needs(needs)?;
-        let effective = effective_registry(&self.registry, &self.transport, inv).await;
+        let (effective, probed) = effective_registry(&self.registry, &self.transport, inv).await;
         let winner = select_reachable(inv, &effective, needs, "urn:llm:select")?;
         let want_json = inv
             .inline_str("as")
@@ -1526,7 +1556,7 @@ impl Endpoint for SelectEndpoint {
         };
         Ok(with_cacheability(
             Representation::new(ReprType::new(media).with_param("charset", "utf-8"), bytes),
-            &self.registry,
+            probed,
         ))
     }
 
@@ -3415,36 +3445,61 @@ mod tests {
     }
 
     #[test]
-    fn config_derived_resources_stay_cacheable_for_pinned_registries() {
-        // The four pinned providers must pay nothing for this feature: a
-        // registry with no discovering provider caches exactly as before.
-        let pinned = Kernel::new(Arc::new(space(
-            MockTransport::new(CANNED),
-            registry_of(SELECTABLE),
-        )));
-        for (iri, arg) in [("urn:llm:models", None), ("urn:llm:select", Some("vision"))] {
+    fn config_derived_resources_are_cacheable_only_when_no_server_was_asked() {
+        // This test used to assert that SELECTABLE caches its inventory and
+        // selections for ever, because every provider in it pins a model. But
+        // two of them declare `vendor: "ollama"`, and that declaration opts into
+        // a live `/api/show` probe on every resolve: the answer was a live fact
+        // marked permanent (ledger #884). What decides cacheability is whether a
+        // server was ASKED, not whether a model was pinned.
+        fn expiry(kernel: &Kernel, iri: &str, needs: Option<&str>, cap: &Capability) -> Expiry {
             let mut req = Request::new(Verb::Source, Iri::parse(iri).unwrap());
-            if let Some(needs) = arg {
+            if let Some(needs) = needs {
                 req = req.with_arg("needs", ArgRef::Inline(needs.as_bytes().to_vec()));
             }
+            block_on(kernel.issue(req, cap)).unwrap().expiry
+        }
+        use ikigai_core::Expiry;
+        let reads = [("urn:llm:models", None), ("urn:llm:select", Some("text"))];
+
+        // Pinned, and no provider opts into discovery: config in, cacheable out.
+        let quiet = kernel_for(FANOUT);
+        for (iri, needs) in reads {
             assert_eq!(
-                issue(&pinned, req).expiry,
-                ikigai_core::Expiry::Never,
-                "{iri} is config-derived here"
+                expiry(&quiet, iri, needs, &Capability::root()),
+                Expiry::Never,
+                "{iri} asked no server"
             );
         }
+
+        // Pinned, but declared ollama vendors are probed: live.
+        let probing = select_kernel(MockTransport::new(SHOW));
+        for (iri, needs) in reads {
+            assert_eq!(
+                expiry(&probing, iri, needs, &Capability::root()),
+                Expiry::Always,
+                "{iri} asked /api/show"
+            );
+        }
+        // ...unless the capability cannot reach the probed host, in which case
+        // nothing was asked and the answer is config and capability alone.
+        let remote_only = Capability::scoped(["urn:cap:net:api.example.com".to_string()]);
+        for (iri, needs) in reads {
+            assert_eq!(
+                expiry(&probing, iri, needs, &remote_only),
+                Expiry::Never,
+                "{iri} under a grant that reaches no ollama host"
+            );
+        }
+
         // One discovering provider makes the inventory a live fact.
         let live = Kernel::new(Arc::new(space(
             MockTransport::new(RAPID_MODELS),
             registry_of(DISCOVERING),
         )));
         assert_eq!(
-            issue(
-                &live,
-                Request::new(Verb::Source, Iri::parse("urn:llm:models").unwrap())
-            )
-            .expiry,
-            ikigai_core::Expiry::Always,
+            expiry(&live, "urn:llm:models", None, &Capability::root()),
+            Expiry::Always,
             "discovery must not be cached"
         );
     }
