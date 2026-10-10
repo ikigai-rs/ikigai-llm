@@ -11,7 +11,10 @@ keywords = ["ikigai", "roc", "llm", "inference", "ollama"]
 categories = ["web-programming"]
 
 [dependencies]
-ikigai-core = "0.1.48" # 0.1.48 = Invocation::trace_note (model-tier span labels)
+# 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME), so no build of this
+# crate's tests has seen anything older; 0.1.48 = Invocation::trace_note (model-tier
+# span labels) is the oldest API the library itself calls.
+ikigai-core = "0.1.89"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
 # client or executor baked into this crate. 0.1.7 = `net_allows_port`, the
@@ -26,18 +29,12 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). Its own floor on
-# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
-# true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.2.0"
-# NOT imported — a FLOOR. `ikigai-conformance` reaches the vocabulary through
-# its own `^0.1.66`, and the VOCABULARY walk over this module's Turtle face is
-# only clean from 0.1.69, where `ik:batchAt` was defined (ikigai-core #107).
-# Under the looser transitive caret a stale registry index resolves 0.1.66 and
-# `a_declared_load_shape_introduces_no_undefined_term` fails on CI alone; this
-# line is what makes that resolution impossible. Remove it only when
-# `ikigai-conformance`'s own pin states 0.1.69 or later.
-ikigai-vocab = "0.1.69"
+# The module recipe as one test (`tests/conformance.rs`). A 0.x caret is a CEILING
+# too: "0.6.0" admits 0.6.x only, so the next minor is a deliberate pin change. 0.6.0
+# brings SPACE-NAME (ledger #987) and pins ikigai-core and ikigai-vocab at 0.1.89,
+# which is what retired this crate's own `ikigai-vocab = "0.1.69"` floor (the
+# `ik:batchAt` term) — the transitive pin now states it.
+ikigai-conformance = "0.6.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
