@@ -320,7 +320,7 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
-## 0.13.1
+## 0.13.1 (2026-10-10)
 
 - **An error body this module cannot read as a structured error is described,
   not forwarded** (ledger #178). An nginx error page or a proxy's plain-text
