@@ -717,7 +717,7 @@ impl Endpoint for OpenAiBackend {
             return Err(Error::Endpoint(format!(
                 "llm backend returned {}: {}",
                 response.status,
-                error_detail(&response.body, &caller_text)
+                error_detail(&response, &caller_text)
             )));
         }
 
@@ -775,14 +775,27 @@ impl Endpoint for OpenAiBackend {
 ///   JSON body in none of those shapes contributes its field NAMES, never its
 ///   values: FastAPI's 422 carries the offending request value (`input`), which
 ///   is the prompt.
-/// * any other body is kept verbatim.
+/// * any other body is DESCRIBED, never forwarded: its media type's essence and
+///   its length, `unstructured error body (text/html, 162 bytes)`. An nginx
+///   error page or a proxy's plain-text refusal is the origin's text, not a
+///   reason this module can type (ledger #178); the status code still says
+///   what kind of failure it was.
 ///
-/// Either way, `caller_text` (the prompt and system prompt) is cut from the
-/// result, in its raw and its JSON-escaped spelling, wherever a server echoed it.
-fn error_detail(body: &[u8], caller_text: &[&str]) -> String {
+/// From a JSON body, `caller_text` (the prompt and system prompt) is then cut,
+/// in its raw and its JSON-escaped spelling, wherever a server echoed it. A
+/// description carries none of the server's text, so there is nothing to cut.
+fn error_detail(response: &HttpResponse, caller_text: &[&str]) -> String {
+    let body = &response.body;
     let detail = match serde_json::from_slice::<Value>(body) {
         Ok(v) => structured_reason(&v),
-        Err(_) => String::from_utf8_lossy(body).into_owned(),
+        Err(_) if body.is_empty() => return "empty error body".to_string(),
+        Err(_) => {
+            return format!(
+                "unstructured error body ({}, {} bytes)",
+                media_type_essence(response.header("content-type")),
+                body.len()
+            )
+        }
     };
     caller_text
         .iter()
@@ -794,6 +807,28 @@ fn error_detail(body: &[u8], caller_text: &[&str]) -> String {
                 .replace(*text, "[prompt]")
                 .replace(escaped, "[prompt]")
         })
+}
+
+/// The `type/subtype` of a `Content-Type` header, parameters dropped and
+/// lowercased — or a fixed phrase when there is none, or when the value is not a
+/// media type. The header is the origin's text as much as the body is, so a
+/// value that is not two RFC 9110 tokens around one `/` is not echoed.
+fn media_type_essence(header: Option<&str>) -> String {
+    let Some(value) = header else {
+        return "no content type".to_string();
+    };
+    let essence = value.split(';').next().unwrap_or("").trim();
+    let is_token = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 64
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    match essence.split_once('/') {
+        Some((kind, sub)) if is_token(kind) && is_token(sub) => essence.to_ascii_lowercase(),
+        _ => "unrecognized content type".to_string(),
+    }
 }
 
 /// The reason a JSON error body states, or the names of the fields it has.

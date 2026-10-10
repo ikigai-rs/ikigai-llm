@@ -320,6 +320,17 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
+## 0.13.1
+
+- **An error body this module cannot read as a structured error is described,
+  not forwarded** (ledger #178). An nginx error page or a proxy's plain-text
+  refusal used to go into the error message whole; it now contributes
+  `unstructured error body (text/html, 162 bytes)` (the `Content-Type`
+  header's `type/subtype`, or `no content type`, and the length), and an empty
+  body says `empty error body`. What still passes through is unchanged: the
+  status code, and a JSON body's stated reason with the prompt cut from it.
+  Pinned by `tests/error_bodies.rs`, which failed on 0.13.0.
+
 ## 0.13.0 (2026-10-08)
 
 Fixes from the unled audit of 0.12.2 (ledger #884), each pinned by a test in
