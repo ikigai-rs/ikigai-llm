@@ -24,7 +24,10 @@ Passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance):
 Ollama's API, and pins by hand what the suite cannot see — every network action
 refuses with a typed `Denied` before any socket opens (under no grants and under
 a grant on another host), an answer is never served from cache, and every
-config-derived result is cut by one golden thread, `urn:llm:config`.
+config-derived result is cut by one golden thread, `urn:llm:config`. The space
+is **host-named**: `space(transport, registry)` is built from what the host hands
+it, one set of doors per configured provider, so it claims no
+`urn:iki:space:llm` name and the host names the instance if it wants one.
 
 ### Inputs
 `prompt` (or piped `content`) · `model` · `system` · `temperature` · `max_tokens`

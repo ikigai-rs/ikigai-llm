@@ -23,15 +23,18 @@
 //!
 //! - [`conforms_without_discovery`] walks a **quiet** registry: one provider
 //!   naming its model and declaring a vendor that opts into no discovery. It
-//!   declares `llm-config`, `llm-models`, `llm-select` and `llm-ollama-model`
-//!   `cacheable`: each is a function of the registry, held to a cache hit on the
-//!   second resolution and to a non-empty thread set — `urn:llm:config`, the
-//!   registry's golden thread, which
+//!   declares `llm-models`, `llm-select` and `llm-ollama-model` `cacheable`:
+//!   each is a function of the registry, held to a cache hit on the second
+//!   resolution and to a golden thread besides its own name — `urn:llm:config`,
+//!   the registry's thread, which
 //!   [`config_derived_results_are_cut_by_the_registry_thread`] cuts by hand.
+//!   `llm-config` is cacheable too, but its thread IS its own name, which the
+//!   check reads as no thread at all (see the waiver below), so that test holds
+//!   it instead.
 //! - [`conforms`] walks a **pinned** registry whose provider declares
 //!   `vendor: "ollama"`, the opt-in to a live `/api/show` probe. The inventory
 //!   and selection ask that server on every resolve, so only `llm-config` and
-//!   `llm-ollama-model` are cacheable there
+//!   `llm-ollama-model` are cacheable there (`llm-ollama-model` declared)
 //!   ([`answers_that_asked_a_server_are_live`]).
 //! - [`conforms_with_a_discovering_provider`] adds a provider that names only
 //!   its **server**. Its `:model` probes the backend (so it declares the net
@@ -41,7 +44,18 @@
 //!   (conformance PENDING #18/#30/#47).
 //!
 //! Nothing is `pure`: every cacheable result reads the registry. No opt-outs:
-//! every action fires against the stub. No module namespace: the Turtle face
+//! every action fires against the stub. One per-check waiver, the same in
+//! every full walk: `CACHEABLE` for `llm-config`, whose golden thread is the
+//! registry thread `urn:llm:config` — its own name. Since conformance 0.5.0 a
+//! Source-only endpoint whose only thread is its own name is reported as caching
+//! state it never named, and the check cannot tell that from a name something
+//! outside cuts (a reload, `urn:kernel:cut`); this one is the latter, and
+//! [`config_derived_results_are_cut_by_the_registry_thread`] pins the cut.
+//!
+//! `SPACE-NAME`: [`ikigai_llm::space`] takes a transport and a registry, and its
+//! doors are one set per configured provider, so it is instance-built and
+//! declared **host-named** — it claims no name; the host that chose the
+//! registry names it (ledger #987). No module namespace: the Turtle face
 //! uses `ik:` terms the shared vocabulary defines — every one of them, load
 //! shape included ([`a_declared_load_shape_introduces_no_undefined_term`]).
 //! NAMES runs: every id is kebab-case.
@@ -81,8 +95,10 @@
 //!   check can see "required but actually optional", PENDING #5/#49).
 
 use async_trait::async_trait;
-use ikigai_conformance::{Checks, Fixture, Report, Suite};
-use ikigai_core::{ArgRef, Capability, Error, Expiry, Iri, Kernel, Representation, Request, Verb};
+use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
+use ikigai_core::{
+    ArgRef, Capability, EndpointSpace, Error, Expiry, Iri, Kernel, Representation, Request, Verb,
+};
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_llm::{OpenAiConfig, Registry};
 use std::io::{Read, Write};
@@ -368,8 +384,44 @@ fn discovering(stub: &Stub) -> Registry {
     registry
 }
 
+/// What the suite's `SPACE-NAME` lines call this module's space: the call that
+/// built it.
+const SPACE_LABEL: &str = "ikigai_llm::space(transport, registry)";
+
+/// Why `CACHEABLE` is waived for `llm-config`, and only for it.
+const CONFIG_THREAD_IS_ITS_OWN_NAME: &str =
+    "its golden thread is the registry thread `urn:llm:config`, which is also its own \
+     name: every config-derived result hangs on that thread and a reload cuts it, so the \
+     name is cut from outside and is not 'no thread' — the check cannot tell the two \
+     apart (conformance 0.5.0). Its cache hit, its thread and the cut are pinned by \
+     config_derived_results_are_cut_by_the_registry_thread";
+
+/// This module's space over `registry`, built once so that the kernel and the
+/// suite's `SPACE-NAME` declaration hold the same instance.
+fn space(registry: Registry) -> Arc<EndpointSpace> {
+    Arc::new(ikigai_llm::space(Arc::new(Client), registry))
+}
+
 fn kernel(registry: Registry) -> Kernel {
-    Kernel::new(Arc::new(ikigai_llm::space(Arc::new(Client), registry)))
+    Kernel::new(space(registry))
+}
+
+/// The full walk over `registry`, with the two declarations every full walk
+/// makes. `space(transport, registry)` is instance-built — its doors are one
+/// set per configured provider, and only the host knows which registry it
+/// passed in — so it is declared **host-named** and claims no name (ledger
+/// #987). `llm-config`'s `CACHEABLE` is waived with [`CONFIG_THREAD_IS_ITS_OWN_NAME`].
+fn walk(suite: Suite, registry: Registry) -> Report {
+    let space = space(registry);
+    let kernel = Kernel::new(space.clone());
+    suite
+        .opt_out_check(
+            "llm-config",
+            Check::Cacheable,
+            CONFIG_THREAD_IS_ITS_OWN_NAME,
+        )
+        .host_named_space(SPACE_LABEL, space)
+        .run_blocking(&kernel)
 }
 
 /// The suite for this module: `llm-select` needs a `needs=` the grammar
@@ -400,7 +452,24 @@ fn assert_shape(report: &Report, providers: usize) {
         "every check runs: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{report}");
+    assert_eq!(
+        report
+            .declared
+            .opted_out_checks
+            .iter()
+            .map(|o| (o.endpoint.as_str(), o.check))
+            .collect::<Vec<_>>(),
+        [("llm-config", Check::Cacheable)],
+        "the one waiver, and nothing else: {report}"
+    );
     assert!(report.declared.pure.is_empty(), "{report}");
+    let spaces: Vec<_> = report
+        .declared
+        .spaces
+        .iter()
+        .map(|s| (s.label.as_str(), s.naming))
+        .collect();
+    assert_eq!(spaces, [(SPACE_LABEL, SpaceNaming::HostNamed)], "{report}");
 }
 
 /// The stub saw only the routes this module speaks, and each `ask` reached it
@@ -431,19 +500,20 @@ fn assert_stub_footprint(stub: &Stub, asks: usize) {
 #[test]
 fn conforms_without_discovery() {
     let stub = Stub::start();
-    let report = suite()
-        .cacheable("llm-config")
-        .cacheable("llm-models")
-        .cacheable("llm-select")
-        .cacheable("llm-ollama-model")
-        .run_blocking(&kernel(quiet(&stub)));
+    let report = walk(
+        suite()
+            .cacheable("llm-models")
+            .cacheable("llm-select")
+            .cacheable("llm-ollama-model"),
+        quiet(&stub),
+    );
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report, 1);
     assert_eq!(
         report.declared.cacheable,
-        ["llm-config", "llm-models", "llm-select", "llm-ollama-model"],
+        ["llm-models", "llm-select", "llm-ollama-model"],
         "{report}"
     );
     assert_stub_footprint(&stub, 2);
@@ -453,25 +523,18 @@ fn conforms_without_discovery() {
 #[test]
 fn conforms() {
     let stub = Stub::start();
-    let report = suite()
-        .cacheable("llm-config")
-        .cacheable("llm-ollama-model")
-        .run_blocking(&kernel(pinned(&stub)));
+    let report = walk(suite().cacheable("llm-ollama-model"), pinned(&stub));
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report, 1);
-    assert_eq!(
-        report.declared.cacheable,
-        ["llm-config", "llm-ollama-model"],
-        "{report}"
-    );
+    assert_eq!(report.declared.cacheable, ["llm-ollama-model"], "{report}");
     assert_stub_footprint(&stub, 2);
 }
 
 #[test]
 fn conforms_with_a_discovering_provider() {
     let stub = Stub::start();
-    let report = suite().run_blocking(&kernel(discovering(&stub)));
+    let report = walk(suite(), discovering(&stub));
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report, 2);
