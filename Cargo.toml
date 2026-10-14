@@ -21,7 +21,7 @@ categories = ["web-programming"]
 # The LIBRARY's true minimum: 0.1.48 = Invocation::trace_note (model-tier span
 # labels), the newest core API it calls. Checked 2026-10-10 by a fresh resolve of
 # src/ alone at ikigai-core =0.1.48 and ikigai-http =0.1.7: it compiles. The TESTS
-# never see it: ikigai-conformance 0.6 (dev) requires core 0.1.89, so the test graph
+# never see it: ikigai-conformance 0.8 (dev) requires core 0.1.100, so the test graph
 # unifies on that. A ceiling too: "0.1.48" admits every 0.1.x and no 0.2.
 ikigai-core = "0.1.48"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
@@ -39,11 +39,12 @@ url = "2"
 [dev-dependencies]
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). A 0.x caret is a CEILING
-# too: "0.6.0" admits 0.6.x only, so the next minor is a deliberate pin change. 0.6.0
-# brings SPACE-NAME (ledger #987) and pins ikigai-core and ikigai-vocab at 0.1.89,
-# which is what retired this crate's own `ikigai-vocab = "0.1.69"` floor (the
-# `ik:batchAt` term) — the transitive pin now states it.
-ikigai-conformance = "0.6.0"
+# too: "0.8.0" admits 0.8.x only, so the next minor is a deliberate pin change. 0.8.0
+# brings REQUIRED (each required input dropped must be refused, typed), on top of 0.7's
+# VALIDATE and 0.6's SPACE-NAME (ledger #987), and pins ikigai-core at 0.1.100 and
+# ikigai-vocab at 0.1.101; the vocab floor is what retired this crate's own
+# `ikigai-vocab = "0.1.69"` (the `ik:batchAt` term), and the transitive pin states it.
+ikigai-conformance = "0.8.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"

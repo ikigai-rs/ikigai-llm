@@ -44,7 +44,12 @@
 //!   (conformance PENDING #18/#30/#47).
 //!
 //! Nothing is `pure`: every cacheable result reads the registry. No opt-outs:
-//! every action fires against the stub. One per-check waiver, the same in
+//! every action fires against the stub, and nothing is `unprobed`. `REQUIRED`
+//! (conformance 0.8.0) resolves each ask again without its `prompt` and
+//! selection without its `needs`, and each must be refused with a typed
+//! `MissingArgument`; the stub's `/v1/chat/completions` count proves those
+//! drops never reached a backend (`assert_stub_footprint`: one ask per action,
+//! as before the check existed). One per-check waiver, the same in
 //! every full walk: `CACHEABLE` for `llm-config`, whose golden thread is the
 //! registry thread `urn:llm:config` — its own name. Since conformance 0.5.0 a
 //! Source-only endpoint whose only thread is its own name is reported as caching
@@ -90,9 +95,10 @@
 //! - **The manifold states the contract**
 //!   ([`the_manifold_states_the_contract`]): every input has a class, every
 //!   action that reaches the network, and selection, declares exactly
-//!   `urn:cap:net:*` and the config reads declare nothing, only `prompt` /
-//!   `needs` are required (no
-//!   check can see "required but actually optional", PENDING #5/#49).
+//!   `urn:cap:net:*` and the config reads declare nothing, and only `prompt` /
+//!   `needs` are required. That a required input is really required is
+//!   `REQUIRED`'s since conformance 0.8.0 (PENDING #5/#49); which inputs are
+//!   required, and that no other one is, stays pinned here.
 
 use async_trait::async_trait;
 use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
@@ -436,9 +442,9 @@ fn endpoints(providers: usize) -> usize {
     4 + 4 * providers
 }
 
-/// The walk saw every endpoint, one Source action each, skipped no check, and
-/// opted nothing out. An endpoint bound without a line here is held to a
-/// weaker standard.
+/// The walk saw every endpoint, one Source action each, skipped no check, left
+/// nothing unprobed, and opted nothing out. An endpoint bound without a line
+/// here is held to a weaker standard.
 fn assert_shape(report: &Report, providers: usize) {
     assert_eq!(report.endpoints, endpoints(providers), "{report}");
     assert_eq!(
@@ -450,6 +456,13 @@ fn assert_shape(report: &Report, providers: usize) {
         report.checks.skipped().count(),
         0,
         "every check runs: {report}"
+    );
+    // A check that could not observe an action reports it as `unprobed`, not as
+    // a finding, so a clean report alone does not say `REQUIRED` saw the asks
+    // refuse a missing `prompt`: this does.
+    assert!(
+        report.unprobed.is_empty(),
+        "every check observed every action: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{report}");
     assert_eq!(
