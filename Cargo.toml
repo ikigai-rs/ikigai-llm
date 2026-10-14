@@ -2,6 +2,13 @@
 name = "ikigai-llm"
 version = "0.13.1"
 edition = "2021"
+# The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
+# on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
+# committed): 1.88 passes both, 1.87 cannot build the graph (icu_* 2.3, reached through
+# url -> idna, declares 1.88). A fresh resolve can move this: when a dependency starts
+# declaring a newer one, the msrv job goes red and names it, and `cargo metadata` lists
+# every package's rust_version.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
 description = "Flexible LLM inference as ikigai ROC resources: urn:llm:ask (a facade grammar) dispatches to pluggable backends. Slice 0 ships an OpenAI-compatible REST backend covering Ollama / vLLM / llama.cpp-server / mlx_lm.server / LM Studio."
