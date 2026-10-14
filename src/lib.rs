@@ -714,11 +714,14 @@ impl Endpoint for OpenAiBackend {
 
         if response.status >= 400 {
             let caller_text: Vec<&str> = std::iter::once(prompt).chain(system).collect();
-            return Err(Error::Endpoint(format!(
-                "llm backend returned {}: {}",
+            return Err(status_error(
                 response.status,
-                error_detail(&response, &caller_text)
-            )));
+                format!(
+                    "llm backend returned {}: {}",
+                    response.status,
+                    error_detail(&response, &caller_text)
+                ),
+            ));
         }
 
         let parsed: Value = serde_json::from_slice(&response.body)
@@ -1790,8 +1793,8 @@ impl Endpoint for SelectEndpoint {
     }
 }
 
-/// POST a JSON payload to a provider, mapping transport failure to an endpoint
-/// error (a 4xx/5xx is still a response — callers decide).
+/// POST a JSON payload to a provider, mapping transport failure to a transient
+/// error ([`transport_failure`]; a 4xx/5xx is still a response — callers decide).
 async fn post_json(
     transport: &dyn HttpTransport,
     url: &str,
@@ -1808,7 +1811,57 @@ async fn post_json(
             body,
         })
         .await
-        .map_err(|e| Error::Endpoint(scrub_userinfo(format!("llm transport error: {e}"), url)))
+        .map_err(|e| transport_failure(&e, url))
+}
+
+/// A request that got no answer at all, typed so the reliability overlays
+/// (ikigai-throttle's Retry, CircuitBreaker and Failover act only on
+/// [`Error::is_transient`]) engage in front of this module (ledger #88): a
+/// timeout is [`Error::Timeout`], and everything else, a refused connection, a
+/// DNS failure, a connection dropped mid-answer, is [`Error::Unavailable`].
+/// Before, all of it was a permanent-looking `Endpoint`, indistinguishable from
+/// a malformed answer, and the overlays never fired.
+///
+/// [`HttpTransport::send`] reports failure as a STRING, so a timeout can only be
+/// recognized by its words ("timed out", "timeout": ureq, reqwest and a
+/// browser's fetch all say one of them). The URL is removed before looking, so
+/// a host named `timeout.example` cannot type its own refusals. Anything not
+/// recognized is `Unavailable`, which is transient too: a misread costs the
+/// Timeout/Unavailable distinction, never the retry.
+fn transport_failure(error: &str, url: &str) -> Error {
+    let message = scrub_userinfo(format!("llm transport error: {error}"), url);
+    let words = error.replace(url, "").to_ascii_lowercase();
+    if words.contains("timed out") || words.contains("timeout") {
+        Error::Timeout(message)
+    } else {
+        Error::Unavailable(message)
+    }
+}
+
+/// An error ANSWER, typed by its status the way ikigai-http types its own:
+/// 408 and 504 are [`Error::Timeout`], 429 and every 5xx are
+/// [`Error::Unavailable`] (the server is overloaded or broken now, and may not
+/// be later), and any other status is a permanent [`Error::Endpoint`], since
+/// asking again gets the same answer.
+fn status_error(status: u16, message: String) -> Error {
+    match status {
+        408 | 504 => Error::Timeout(message),
+        429 | 500..=599 => Error::Unavailable(message),
+        _ => Error::Endpoint(message),
+    }
+}
+
+/// Reword an error with context and KEEP its type: wrapping a transient failure
+/// in a permanent `Endpoint` would hide it from the overlays all over again.
+/// A type with no message of its own to carry is reworded as `Endpoint`, as
+/// before.
+fn with_context(error: Error, context: impl FnOnce(&str) -> String) -> Error {
+    match error {
+        Error::Timeout(m) => Error::Timeout(context(&m)),
+        Error::Unavailable(m) => Error::Unavailable(context(&m)),
+        Error::Endpoint(m) => Error::Endpoint(context(&m)),
+        other => Error::Endpoint(context(&other.to_string())),
+    }
 }
 
 /// One installed model: its name and — where the provider reports it — its
@@ -1911,11 +1964,15 @@ async fn resolve_model(
             // and wrapping it would turn the permanent, typed `Denied` into a
             // retryable-looking endpoint error.
             denied @ Error::Denied(_) => denied,
-            other => Error::Endpoint(format!(
-                "{who}: could not discover a model at `{}` — this provider declares no \
-                 `model`, and listing the server's models failed: {other}",
-                redacted_url(&config.base_url)
-            )),
+            // And a transient one keeps ITS type: a server that is down or slow
+            // is what Retry and Failover are for (ledger #88).
+            other => with_context(other, |why| {
+                format!(
+                    "{who}: could not discover a model at `{}` — this provider declares no \
+                     `model`, and listing the server's models failed: {why}",
+                    redacted_url(&config.base_url)
+                )
+            }),
         })?;
     models
         .into_iter()
@@ -1966,10 +2023,13 @@ async fn installed_models(
     )?;
     let response = get(transport, config, url).await?;
     if response.status >= 400 {
-        return Err(Error::Endpoint(format!(
-            "urn:llm:{}:installed: provider returned {}",
-            config.provider, response.status
-        )));
+        return Err(status_error(
+            response.status,
+            format!(
+                "urn:llm:{}:installed: provider returned {}",
+                config.provider, response.status
+            ),
+        ));
     }
     let v: Value = serde_json::from_slice(&response.body)
         .map_err(|e| Error::Endpoint(format!("llm: model list was not JSON: {e}")))?;
@@ -2058,10 +2118,10 @@ async fn installed_via_tags(
     }
     let response = get(transport, config, url).await?;
     if response.status >= 400 {
-        return Err(Error::Endpoint(format!(
-            "llm: /api/tags returned {}",
-            response.status
-        )));
+        return Err(status_error(
+            response.status,
+            format!("llm: /api/tags returned {}", response.status),
+        ));
     }
     let v: Value = serde_json::from_slice(&response.body)
         .map_err(|e| Error::Endpoint(format!("llm: /api/tags was not JSON: {e}")))?;
@@ -2086,7 +2146,8 @@ async fn installed_via_tags(
 }
 
 /// A capability-checked-elsewhere GET to a provider, carrying its headers and
-/// mapping transport failure to an error (credentials scrubbed from it).
+/// mapping transport failure to a transient error ([`transport_failure`];
+/// credentials scrubbed from it).
 async fn get(
     transport: &dyn HttpTransport,
     config: &OpenAiConfig,
@@ -2100,7 +2161,7 @@ async fn get(
             body: Vec::new(),
         })
         .await
-        .map_err(|e| Error::Endpoint(scrub_userinfo(format!("llm transport error: {e}"), &url)))
+        .map_err(|e| transport_failure(&e, &url))
 }
 
 /// `urn:llm:<provider>:installed` — what the provider can actually serve right
@@ -3329,6 +3390,31 @@ mod tests {
             ),
         );
         assert_eq!(out.bytes, b"real:latest\nother:7b");
+    }
+
+    /// The transport's failure is a string, so a timeout is recognized by its
+    /// words, in each spelling a host transport uses, and never by the URL's.
+    #[test]
+    fn a_transport_failure_is_typed_by_its_words_not_its_url() {
+        let url = "http://timeout.example:8000/v1/chat/completions";
+        for said in [
+            "Network Error: timed out reading response",  // ureq
+            "error sending request: operation timed out", // reqwest
+            "TimeoutError: signal timed out",             // fetch + AbortSignal.timeout
+            "connect timeout",
+        ] {
+            let err = transport_failure(&format!("{url}: {said}"), url);
+            assert!(matches!(err, Error::Timeout(_)), "{said}: {err:?}");
+        }
+        for said in [
+            "Connection Failed: Connect error: Connection refused (os error 61)",
+            "Dns Failed: resolve dns name",
+            "TypeError: Failed to fetch",
+        ] {
+            let err = transport_failure(&format!("{url}: {said}"), url);
+            assert!(matches!(err, Error::Unavailable(_)), "{said}: {err:?}");
+            assert!(err.is_transient());
+        }
     }
 
     /// A transport whose server is unreachable — every send fails.
