@@ -636,6 +636,7 @@ impl Endpoint for OpenAiBackend {
         let max_tokens = optional_str(inv, "max_tokens")?
             .map(parse_max_tokens)
             .transpose()?;
+        let face = requested_face(inv, &TEXT_OR_JSON)?;
 
         // `model=` wins verbatim — always, for a discovering provider too: the
         // caller named a model, and naming one is never a request to go looking.
@@ -733,11 +734,7 @@ impl Endpoint for OpenAiBackend {
 
         // Default: the completion text. `as=application/json`: a normalized
         // envelope. Uncacheable by default (generation is non-deterministic).
-        let want_json = inv
-            .inline_str("as")
-            .map(|s| s.contains("json"))
-            .unwrap_or(false);
-        if want_json {
+        if face == "application/json" {
             let envelope = json!({
                 "text": text,
                 "model": parsed["model"].as_str().unwrap_or(answered_by.as_str()),
@@ -880,6 +877,44 @@ fn optional_str<'i>(inv: &'i Invocation<'_>, name: &str) -> Result<Option<&'i st
     }
 }
 
+/// The faces an endpoint serves through `as=`, DEFAULT FIRST. One list feeds
+/// both the `as` ArgSpec's `one_of` (what the manifold and
+/// `urn:kernel:validate` hold a call to) and [`requested_face`] (what the code
+/// serves), so the two cannot drift apart again (ledger #179).
+const TEXT_OR_JSON: [&str; 2] = ["text/plain", "application/json"];
+/// See [`TEXT_OR_JSON`]: `urn:llm:models`, whose default is the JSON inventory.
+const JSON_OR_TURTLE: [&str; 2] = ["application/json", "text/turtle"];
+
+/// The face a caller asked for with `as=`, matched against the declared `faces`
+/// by the media type's ESSENCE: parameters dropped and case folded (RFC 9110
+/// section 8.3.1), so `application/json; charset=utf-8` is `application/json`.
+/// Absent means `faces[0]`, the declared default. Anything else is refused,
+/// as the manifold refuses it: `contains("json")` used to serve JSON for
+/// `application/ld+json` and the default for a face never declared.
+fn requested_face(inv: &Invocation<'_>, faces: &[&'static str]) -> Result<&'static str> {
+    let Some(asked) = optional_str(inv, "as")? else {
+        return Ok(faces[0]);
+    };
+    let essence = asked
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    faces
+        .iter()
+        .copied()
+        .find(|face| *face == essence)
+        .ok_or_else(|| Error::InvalidArgument {
+            name: "as".to_string(),
+            detail: format!(
+                "not a face this endpoint serves; one of: {} (parameters such as \
+                 charset are ignored)",
+                faces.join(", ")
+            ),
+        })
+}
+
 /// `temperature`, declared `xsd:double`: a finite number or a refusal. A value
 /// that does not parse used to be dropped (the request went without one), and a
 /// non-finite one was sent as JSON `null`, which JSON cannot represent otherwise.
@@ -944,8 +979,8 @@ fn ask_description(id: &str, summary: &str) -> Description {
             ArgSpec::new("as")
                 .summary("application/json for a {text,model,usage} envelope; default text/plain")
                 .class(XSD_STRING)
-                .one_of(["text/plain", "application/json"])
-                .default_value("text/plain")
+                .one_of(TEXT_OR_JSON)
+                .default_value(TEXT_OR_JSON[0])
                 .optional(),
         )
         .output("text/plain;charset=utf-8")
@@ -1248,12 +1283,10 @@ impl Endpoint for ModelsEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // The inventory is declared ⊕ discovered — gaps filled live from the
         // provider (Ollama /api/show) where declared vendor + capability allow.
+        // The face is read first: an undeclared one costs no probe.
+        let face = requested_face(inv, &JSON_OR_TURTLE)?;
         let (effective, probed) = effective_registry(&self.registry, &self.transport, inv).await;
-        let want_turtle = inv
-            .inline_str("as")
-            .map(|s| s.contains("turtle"))
-            .unwrap_or(false);
-        let (media, bytes) = if want_turtle {
+        let (media, bytes) = if face == "text/turtle" {
             ("text/turtle", Self::as_turtle(&effective).into_bytes())
         } else {
             (
@@ -1287,8 +1320,8 @@ impl Endpoint for ModelsEndpoint {
                 ArgSpec::new("as")
                     .summary("output representation: application/json (default) or text/turtle")
                     .class(XSD_STRING)
-                    .one_of(["application/json", "text/turtle"])
-                    .default_value("application/json")
+                    .one_of(JSON_OR_TURTLE)
+                    .default_value(JSON_OR_TURTLE[0])
                     .optional(),
             )
             .output("application/json;charset=utf-8")
@@ -1716,15 +1749,12 @@ impl SelectEndpoint {
 impl Endpoint for SelectEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let needs = inv.inline_str("needs")?;
-        // The grammar first: a malformed `needs=` costs no probe.
+        // The grammar first: a malformed `needs=` or `as=` costs no probe.
         parse_needs(needs)?;
+        let face = requested_face(inv, &TEXT_OR_JSON)?;
         let (effective, probed) = effective_registry(&self.registry, &self.transport, inv).await;
         let winner = select_reachable(inv, &effective, needs, "urn:llm:select")?;
-        let want_json = inv
-            .inline_str("as")
-            .map(|s| s.contains("json"))
-            .unwrap_or(false);
-        let (media, bytes) = if want_json {
+        let (media, bytes) = if face == "application/json" {
             let detail = json!({
                 "backend": format!("urn:llm:{}:ask", winner.provider),
                 "provider": winner.provider,
@@ -1780,8 +1810,8 @@ impl Endpoint for SelectEndpoint {
                 ArgSpec::new("as")
                     .summary("text/plain backend IRI (default) or application/json detail")
                     .class(XSD_STRING)
-                    .one_of(["text/plain", "application/json"])
-                    .default_value("text/plain")
+                    .one_of(TEXT_OR_JSON)
+                    .default_value(TEXT_OR_JSON[0])
                     .optional(),
             )
             .output("text/plain;charset=utf-8")
@@ -2183,15 +2213,12 @@ impl InstalledEndpoint {
 impl Endpoint for InstalledEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let supports = optional_str(inv, "supports")?;
+        let face = requested_face(inv, &TEXT_OR_JSON)?;
         let mut models = installed_models(self.transport.as_ref(), inv, &self.config).await?;
         if let Some(want) = supports {
             models.retain(|m| model_supports(m, want));
         }
-        let want_json = inv
-            .inline_str("as")
-            .map(|s| s.contains("json"))
-            .unwrap_or(false);
-        let (media, bytes) = if want_json {
+        let (media, bytes) = if face == "application/json" {
             let detail: Vec<Value> = models
                 .iter()
                 .map(
@@ -2229,8 +2256,8 @@ impl Endpoint for InstalledEndpoint {
                 ArgSpec::new("as")
                     .summary("text/plain newline list (default) or application/json")
                     .class(XSD_STRING)
-                    .one_of(["text/plain", "application/json"])
-                    .default_value("text/plain")
+                    .one_of(TEXT_OR_JSON)
+                    .default_value(TEXT_OR_JSON[0])
                     .optional(),
             )
             .input(
