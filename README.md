@@ -320,6 +320,27 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
+## Failures are typed for the reliability overlays
+
+A backend that is down or slow fails with a **transient** error, so
+ikigai-throttle's Retry, CircuitBreaker and Failover (which act only on
+`Error::is_transient`) engage in front of `urn:llm:*`:
+
+| What happened | Error |
+|---|---|
+| connection refused, DNS failure, connection dropped | `Unavailable` |
+| the request timed out | `Timeout` |
+| the backend answered 429 or any 5xx | `Unavailable` |
+| the backend answered 408 or 504 | `Timeout` |
+| any other 4xx, or a 2xx that is not a completion | `Endpoint` (permanent) |
+| no capability to reach the host | `Denied` (permanent) |
+
+The type survives the `urn:llm:ask` facade and the wrapping a discovering
+provider adds (`could not discover a model at …`). A transport reports failure
+as text, so a timeout is recognized by its words (`timed out`, `timeout`);
+anything else unanswered is `Unavailable`. Pinned by `tests/transport_errors.rs`
+against scratch servers on 127.0.0.1.
+
 ## 0.13.1 (2026-10-10)
 
 - **An error body this module cannot read as a structured error is described,
