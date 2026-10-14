@@ -41,6 +41,13 @@ policy it could not read must not route there. `temperature` must be a finite
 number and `max_tokens` a positive integer, or the ask is refused before any
 request is sent.
 
+`as` is matched by the media type's essence against the faces each endpoint
+declares (its `one_of`, which is what `urn:kernel:validate` checks):
+parameters are ignored and case is folded, so `as=application/json;
+charset=utf-8` is the JSON face, and a face the endpoint does not declare
+(`application/ld+json`, `text/turtle` on an ask) is refused before any request
+is sent, never answered with something else.
+
 ### Mounting it
 The host injects an [`ikigai_http::HttpTransport`] (the same seam `ikigai-http`
 uses — `ureq`/`reqwest` natively, `fetch` in the browser):
