@@ -348,6 +348,27 @@ as text, so a timeout is recognized by its words (`timed out`, `timeout`);
 anything else unanswered is `Unavailable`. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.14.0 (2026-10-13)
+
+Minor: two changes alter which error variant a caller sees.
+
+- **Failures are typed for the reliability overlays** (ledger #88). Every
+  failure was `Error::Endpoint`, so ikigai-throttle's Retry, CircuitBreaker
+  and Failover never engaged. A refused connection, a DNS failure and a 429/5xx
+  answer are now `Unavailable`; a timeout and a 408/504 answer are `Timeout`;
+  any other 4xx and a malformed answer stay `Endpoint`. A discovering
+  provider's `could not discover a model` wrap keeps the inner type. See
+  [Failures are typed](#failures-are-typed-for-the-reliability-overlays);
+  pinned by `tests/transport_errors.rs`, 8 of whose 11 tests failed on 0.13.1.
+- **`as=` matches the declared faces** (ledger #179): by the media type's
+  essence (parameters ignored, case folded), against the same list the
+  manifold's `one_of` carries. An undeclared face is refused with
+  `InvalidArgument` before any request is sent; it used to be answered
+  (`application/ld+json` got JSON) or silently given the default. Pinned by
+  `tests/as_faces.rs`.
+- **`rust-version = "1.88"`**, the measured floor (ledger #181), so the shared
+  CI's msrv job runs clippy and the tests on it instead of skipping.
+
 ## 0.13.1 (2026-10-10)
 
 - **An error body this module cannot read as a structured error is described,
