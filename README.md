@@ -348,6 +348,24 @@ as text, so a timeout is recognized by its words (`timed out`, `timeout`);
 anything else unanswered is `Unavailable`. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.15.0 (2026-10-17)
+
+- **BREAKING for hosts: `ikigai-http` moves to 0.2.0** (the naming wave,
+  ledger #11). Nothing in this crate's behavior changes, and it names no http
+  endpoint. But `space(transport, registry)` takes an
+  `Arc<dyn ikigai_http::HttpTransport>`, and a host normally shares ONE
+  transport between `ikigai-http`'s space and this one, so both must name the
+  same `ikigai-http`: a host still on 0.1.x gets a trait from a different crate
+  version and fails to compile. Move `ikigai-http` to 0.2 with this release.
+  There, `ikigai_http::space()` returns core's `Alias` overlay rather than an
+  `EndpointSpace` (hold it as `Arc<dyn Space>`), the endpoints are
+  `urn:http:get` … `urn:http:delete` with ids `http-get` … `http-delete`, and
+  `urn:httpGet` … `urn:httpDelete` resolve as deprecated aliases until
+  `ikigai-http` 0.3.0. See its CHANGELOG.
+- **The `ikigai-core` floor moves 0.1.48 → 0.1.86**, `ikigai-http` 0.2.0's own
+  core floor. A fresh resolve of `src/` alone at core `=0.1.86` and http
+  `=0.2.0` compiles.
+
 ## 0.14.0 (2026-10-13)
 
 Minor: two changes alter which error variant a caller sees.
