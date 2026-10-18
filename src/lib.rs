@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
-    Representation, Request, Result, Verb,
+    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation, Iri,
+    ReprType, Representation, Request, Result, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method};
 use serde::Deserialize;
@@ -728,8 +728,9 @@ impl Endpoint for OpenAiBackend {
 
         if response.status >= 400 {
             let caller_text: Vec<&str> = std::iter::once(prompt).chain(system).collect();
-            return Err(status_error(
-                response.status,
+            return Err(status_failure(
+                inv,
+                &response,
                 format!(
                     "llm backend returned {}: {}",
                     response.status,
@@ -956,7 +957,7 @@ fn parse_max_tokens(s: &str) -> Result<u64> {
 
 /// The shared parameter contract for the facade and the backends.
 fn ask_description(id: &str, summary: &str) -> Description {
-    Description::new(id)
+    let description = Description::new(id)
         .summary(summary)
         .verb(Verb::Source)
         .input(
@@ -998,7 +999,35 @@ fn ask_description(id: &str, summary: &str) -> Description {
         )
         .output("text/plain;charset=utf-8")
         .output("application/json;charset=utf-8")
-        .requires(CAP_NET)
+        .requires(CAP_NET);
+    fails_like_an_origin(description)
+}
+
+/// The failure classes an action that asks a provider over HTTP can produce, declared
+/// (core 0.1.108's `Description::fails`, ledger #1546) so a caller or an agent plans its
+/// retries from the contract: every class ikigai-http's status table and transport
+/// table can return besides the implied ones, `permanent` (a 404, a 409, a 501, a bad
+/// argument) and `denied` (beside the declared `urn:cap:net:*`).
+///
+/// - `transient`: no answer (a refused connection, a DNS failure, a timeout), a 502, a
+///   503 without a delay, a 408 or 504;
+/// - `retry-after`: a 429, or a 503 carrying `Retry-After`;
+/// - `over-budget`: a 413, 414 or 431 (the prompt was too large for the server);
+/// - `refused`: a 401 or 403 (the server refused the configured key);
+/// - `unknown`: a 500 or other 5xx, an answer that is not the JSON this crate reads.
+const ORIGIN_FAILURES: [FailureClass; 5] = [
+    FailureClass::Transient,
+    FailureClass::RetryAfter,
+    FailureClass::OverBudget,
+    FailureClass::Refused,
+    FailureClass::Unknown,
+];
+
+/// `description` declaring [`ORIGIN_FAILURES`].
+fn fails_like_an_origin(description: Description) -> Description {
+    ORIGIN_FAILURES
+        .into_iter()
+        .fold(description, Description::fails)
 }
 
 // ---- the config resource ----------------------------------------------------
@@ -1058,6 +1087,8 @@ impl Endpoint for ConfigEndpoint {
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("application/json")
+            // A config read: it cannot fail but for a malformed request.
+            .fails(FailureClass::Permanent)
     }
 }
 
@@ -1141,20 +1172,23 @@ impl Endpoint for ModelEndpoint {
         // only it declares the net capability (declaring it on the config read
         // would make the manifold over-offer).
         if self.config.default_model.is_some() {
-            description.summary(
+            // A config read: it cannot fail but for a malformed request.
+            description.fails(FailureClass::Permanent).summary(
                 "The provider's configured model id, verbatim (text/plain) — the cheap \
                  identity face for consumers folding true model identity into derived \
                  artifacts (archive version tags, provenance labels) without pulling \
                  the whole urn:llm:config registry. No network; cacheable.",
             )
         } else {
-            description
-                .summary(
-                    "The model this provider's SERVER is serving right now (text/plain) \
-                     — this provider pinned no model, so the discovered id is the only \
-                     honest identity. Probes the backend; uncacheable.",
-                )
-                .requires(CAP_NET)
+            fails_like_an_origin(
+                description
+                    .summary(
+                        "The model this provider's SERVER is serving right now (text/plain) \
+                         — this provider pinned no model, so the discovered id is the only \
+                         honest identity. Probes the backend; uncacheable.",
+                    )
+                    .requires(CAP_NET),
+            )
         }
     }
 }
@@ -1339,6 +1373,9 @@ impl Endpoint for ModelsEndpoint {
             )
             .output("application/json;charset=utf-8")
             .output("text/turtle;charset=utf-8")
+            // Discovery is best-effort (a provider that does not answer keeps its
+            // declared profile), so only a malformed request fails.
+            .fails(FailureClass::Permanent)
     }
 }
 
@@ -1833,6 +1870,9 @@ impl Endpoint for SelectEndpoint {
             // no net grant can never be answered: the floor states that up front
             // (and its discovery probes are net-gated besides).
             .requires(CAP_NET)
+            // Discovery is best-effort, so no origin's failure reaches the caller; a
+            // `needs` nothing satisfies is the untyped no-match (`Endpoint`).
+            .fails(FailureClass::Unknown)
     }
 }
 
@@ -1857,52 +1897,100 @@ async fn post_json(
         .map_err(|e| transport_failure(&e, url))
 }
 
-/// A request that got no answer at all, typed so the reliability overlays
-/// (ikigai-throttle's Retry, CircuitBreaker and Failover act only on
-/// [`Error::is_transient`]) engage in front of this module (ledger #88): a
-/// timeout is [`Error::Timeout`], and everything else, a refused connection, a
-/// DNS failure, a connection dropped mid-answer, is [`Error::Unavailable`].
-/// Before, all of it was a permanent-looking `Endpoint`, indistinguishable from
-/// a malformed answer, and the overlays never fired.
+/// A request that got no answer at all, typed by ikigai-http's one table
+/// ([`ikigai_http::status::transport_error`], ledger #1546): a timeout is
+/// [`Error::Timeout`], and everything else, a refused connection, a DNS failure, a
+/// connection dropped mid-answer, is [`Error::Unavailable`]. Both are transient, so
+/// the reliability overlays (ikigai-throttle's Retry, CircuitBreaker and Failover)
+/// engage in front of this module (ledger #88).
 ///
-/// [`HttpTransport::send`] reports failure as a STRING, so a timeout can only be
-/// recognized by its words ("timed out", "timeout": ureq, reqwest and a
-/// browser's fetch all say one of them). The URL is removed before looking, so
-/// a host named `timeout.example` cannot type its own refusals. Anything not
-/// recognized is `Unavailable`, which is transient too: a misread costs the
-/// Timeout/Unavailable distinction, never the retry.
+/// The table recognizes a timeout by the transport's WORDS with the URL removed, so a
+/// host named `timeout.example` cannot type its own refusals. The message is this
+/// crate's: the transport's string with the URL's `user:password@` scrubbed, because a
+/// transport may quote the URL it was handed, credentials and all (ledger #1898).
 fn transport_failure(error: &str, url: &str) -> Error {
     let message = scrub_userinfo(format!("llm transport error: {error}"), url);
-    let words = error.replace(url, "").to_ascii_lowercase();
-    if words.contains("timed out") || words.contains("timeout") {
-        Error::Timeout(message)
-    } else {
-        Error::Unavailable(message)
-    }
+    ikigai_http::status::transport_error(error, url, message)
 }
 
-/// An error ANSWER, typed by its status the way ikigai-http types its own:
-/// 408 and 504 are [`Error::Timeout`], 429 and every 5xx are
-/// [`Error::Unavailable`] (the server is overloaded or broken now, and may not
-/// be later), and any other status is a permanent [`Error::Endpoint`], since
-/// asking again gets the same answer.
-fn status_error(status: u16, message: String) -> Error {
-    match status {
-        408 | 504 => Error::Timeout(message),
-        429 | 500..=599 => Error::Unavailable(message),
-        _ => Error::Endpoint(message),
-    }
+/// An error ANSWER, typed by ikigai-http's one status table
+/// ([`ikigai_http::status::response_error`], ledger #1546), which reads the WHOLE
+/// response, so a `Retry-After` header (delay-seconds, or an HTTP-date measured on
+/// the kernel's clock, [`Invocation::now`]) rides a 429 or a 503 as
+/// [`Error::RetryAfter`]'s delay. Its rows, as this crate's callers see them: 401/403
+/// [`Error::Refused`], 404/410 [`Error::NotFound`], 408/504 [`Error::Timeout`], 429
+/// [`Error::RetryAfter`], 502 (and a 503 with no usable delay) [`Error::Unavailable`],
+/// 500 and other 5xx [`Error::Endpoint`]. A status below 400 is not an error, and is
+/// never passed here.
+///
+/// What a caller of `urn:llm:<provider>:ask` sees for a backend's 429 with
+/// `Retry-After: 30`: the delay, the class, and the body's reason (never its echo).
+///
+/// ```
+/// use std::sync::Arc;
+/// use async_trait::async_trait;
+/// use ikigai_core::{ArgRef, Capability, Error, FailureClass, Iri, Kernel, Request, Verb};
+/// use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+/// use ikigai_llm::{space, OpenAiConfig, Registry};
+///
+/// struct RateLimited;
+/// #[async_trait]
+/// impl HttpTransport for RateLimited {
+///     async fn send(&self, _: HttpRequest) -> Result<HttpResponse, String> {
+///         Ok(HttpResponse {
+///             status: 429,
+///             headers: vec![("Retry-After".into(), "30".into())],
+///             body: br#"{"error":{"message":"slow down"}}"#.to_vec(),
+///         })
+///     }
+/// }
+///
+/// let llm = space(Arc::new(RateLimited), Registry::single(OpenAiConfig::ollama("m")));
+/// let kernel = Kernel::new(Arc::new(llm));
+/// let ask = Request::new(Verb::Source, Iri::parse("urn:llm:ollama:ask").unwrap())
+///     .with_arg("prompt", ArgRef::Inline(b"hi".to_vec()))
+///     .with_arg("model", ArgRef::Inline(b"m".to_vec()));
+/// let err = futures::executor::block_on(kernel.issue(ask, &Capability::root())).unwrap_err();
+/// assert!(matches!(err, Error::RetryAfter { .. }));
+/// assert_eq!(err.class(), FailureClass::RetryAfter);
+/// assert_eq!(err.retry_after_millis(), Some(30_000));
+/// assert_eq!(
+///     err.to_string(),
+///     "retry after 30000 ms: rate-limited: llm backend returned 429: slow down"
+/// );
+/// ```
+fn status_failure(inv: &Invocation<'_>, response: &HttpResponse, message: String) -> Error {
+    ikigai_http::status::response_error(response, inv.now(), message.clone())
+        // Unreachable: every caller checks `status >= 400` first. If one ever did
+        // not, a success read as a failure is still a failure, never a panic.
+        .unwrap_or(Error::Endpoint(message))
 }
 
-/// Reword an error with context and KEEP its type: wrapping a transient failure
-/// in a permanent `Endpoint` would hide it from the overlays all over again.
-/// A type with no message of its own to carry is reworded as `Endpoint`, as
-/// before.
+/// Reword an error with context and KEEP its type, a delay included: wrapping a
+/// transient failure in a permanent `Endpoint` hides it from the overlays, and
+/// wrapping a `RetryAfter`, a `Refused` or a `NotFound` loses the retry rule its class
+/// carries (ledger #1546). A type with no message of its own to carry is reworded as
+/// `Endpoint`, as before.
 fn with_context(error: Error, context: impl FnOnce(&str) -> String) -> Error {
     match error {
         Error::Timeout(m) => Error::Timeout(context(&m)),
         Error::Unavailable(m) => Error::Unavailable(context(&m)),
         Error::Endpoint(m) => Error::Endpoint(context(&m)),
+        Error::Denied(m) => Error::Denied(context(&m)),
+        Error::Refused(m) => Error::Refused(context(&m)),
+        Error::NotFound(m) => Error::NotFound(context(&m)),
+        Error::Conflict(m) => Error::Conflict(context(&m)),
+        Error::RetryAfter { delay, detail } => Error::RetryAfter {
+            delay,
+            detail: context(&detail),
+        },
+        Error::OverBudget { detail } => Error::OverBudget {
+            detail: context(&detail),
+        },
+        Error::Unsupported { verb, detail } => Error::Unsupported {
+            verb,
+            detail: context(&detail),
+        },
         other => Error::Endpoint(context(&other.to_string())),
     }
 }
@@ -2066,8 +2154,9 @@ async fn installed_models(
     )?;
     let response = get(transport, config, url).await?;
     if response.status >= 400 {
-        return Err(status_error(
-            response.status,
+        return Err(status_failure(
+            inv,
+            &response,
             format!(
                 "urn:llm:{}:installed: provider returned {}",
                 config.provider, response.status
@@ -2163,8 +2252,9 @@ async fn installed_via_tags(
     }
     let response = get(transport, config, url).await?;
     if response.status >= 400 {
-        return Err(status_error(
-            response.status,
+        return Err(status_failure(
+            inv,
+            &response,
             format!("llm: /api/tags returned {}", response.status),
         ));
     }
@@ -2259,7 +2349,7 @@ impl Endpoint for InstalledEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new(format!("llm-{}-installed", self.config.provider))
+        let description = Description::new(format!("llm-{}-installed", self.config.provider))
             .summary(
                 "The models the provider can actually serve right now (newline list; \
                  as=application/json for an array). Live fact — uncacheable. The \
@@ -2286,7 +2376,8 @@ impl Endpoint for InstalledEndpoint {
             )
             .output("text/plain;charset=utf-8")
             .output("application/json;charset=utf-8")
-            .requires(CAP_NET)
+            .requires(CAP_NET);
+        fails_like_an_origin(description)
     }
 }
 
@@ -2346,6 +2437,9 @@ impl Endpoint for UpEndpoint {
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8")
             .requires(CAP_NET)
+            // A server that does not answer is `false`, not an error; only a
+            // `base_url` that does not parse fails, untyped (`Endpoint`).
+            .fails(FailureClass::Unknown)
     }
 }
 
