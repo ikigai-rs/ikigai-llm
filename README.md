@@ -334,25 +334,40 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
-## Failures are typed for the reliability overlays
+## Failures are typed, and each type says who may retry it
 
-A backend that is down or slow fails with a **transient** error, so
-ikigai-throttle's Retry, CircuitBreaker and Failover (which act only on
-`Error::is_transient`) engage in front of `urn:llm:*`:
+Every failure to get an answer is typed by `ikigai-http`'s one table
+(`ikigai_http::status`, since 0.16.0; ledger #1546), and the variant's
+**class** (`Error::class`, ikigai-core 0.1.108) says who may repeat it.
+ikigai-throttle's Retry, CircuitBreaker and Failover act on that class in front
+of `urn:llm:*`:
 
-| What happened | Error |
-|---|---|
-| connection refused, DNS failure, connection dropped | `Unavailable` |
-| the request timed out | `Timeout` |
-| the backend answered 429 or any 5xx | `Unavailable` |
-| the backend answered 408 or 504 | `Timeout` |
-| any other 4xx, or a 2xx that is not a completion | `Endpoint` (permanent) |
-| no capability to reach the host | `Denied` (permanent) |
+| What happened | Error | Class |
+|---|---|---|
+| connection refused, DNS failure, connection dropped | `Unavailable` | transient |
+| the request timed out, or the backend answered 408 or 504 | `Timeout` | transient |
+| the backend answered 502, or 503 with no usable `Retry-After` | `Unavailable` | transient |
+| the backend answered 429, or 503 with `Retry-After` | `RetryAfter`, with the delay | retry-after |
+| the backend answered 413, 414 or 431 | `OverBudget` | over-budget |
+| the backend answered 401 or 403 (it refused the configured key) | `Refused` | refused |
+| the backend answered 404 or 410 | `NotFound` | permanent |
+| the backend answered 409 or 412 | `Conflict` | permanent |
+| the backend answered 501 | `Unsupported` | permanent |
+| the backend answered 500 or another 5xx, any other 4xx, or a 2xx that is not a completion | `Endpoint` | unknown |
+| no capability to reach the host | `Denied` | denied |
+
+A `Retry-After` is read in both of its forms: delay-seconds, and an HTTP-date
+measured on the kernel's clock. Every action declares the classes it can fail
+with (`Description::fails`), and `tests/conformance.rs` holds it to them
+(conformance's FAILURES check), with two probes against a fake origin: each ask
+fails as `retry-after` under a 429 and as `refused` under a 401.
 
 The type survives the `urn:llm:ask` facade and the wrapping a discovering
-provider adds (`could not discover a model at …`). A transport reports failure
-as text, so a timeout is recognized by its words (`timed out`, `timeout`);
-anything else unanswered is `Unavailable`. Pinned by `tests/transport_errors.rs`
+provider adds (`could not discover a model at …`), a `RetryAfter`'s delay
+included. A transport reports failure as text, so a timeout is recognized by
+its words (`timed out`, `timeout`) with the URL removed; anything else
+unanswered is `Unavailable`. The message is this crate's, with any
+`user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
 ## 0.15.1 (2026-10-18)

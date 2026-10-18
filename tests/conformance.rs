@@ -103,7 +103,8 @@
 use async_trait::async_trait;
 use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
 use ikigai_core::{
-    ArgRef, Capability, EndpointSpace, Error, Expiry, Iri, Kernel, Representation, Request, Verb,
+    ArgRef, Capability, EndpointSpace, Error, Expiry, FailureClass, Iri, Kernel, Representation,
+    Request, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_llm::{OpenAiConfig, Registry};
@@ -127,6 +128,11 @@ const NET_WILDCARD: &str = "urn:cap:net:*";
 
 /// The registry's golden thread.
 const CONFIG_THREAD: &str = "urn:llm:config";
+
+/// The model names the stub answers 429 (with `Retry-After`) and 401 for.
+const LIMITED_MODEL: &str = "limited:1b";
+const LOCKED_MODEL: &str = "locked:1b";
+const RETRY_AFTER_SECS: u64 = 2;
 
 /// A prompt no stub answer, no description and no error may contain.
 const PROMPT: &str = "SECRET-PROMPT-7f3a-never-echoed";
@@ -226,8 +232,14 @@ impl Stub {
                         .lock()
                         .unwrap()
                         .push(Received { method, path, body });
+                    // A rate limit states when to come back.
+                    let retry_after = if status == 429 {
+                        format!("Retry-After: {RETRY_AFTER_SECS}\r\n")
+                    } else {
+                        String::new()
+                    };
                     let head = format!(
-                        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
+                        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n{retry_after}\
                          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                         body_out.len()
                     );
@@ -279,9 +291,25 @@ impl Drop for Stub {
 /// The stub's script: Ollama's four routes under `/v1` (the OpenAI-compatible
 /// face) and `/api` (the native face); under `/echo/v1` a 400 whose body
 /// carries the request back beside its `error.message`; anything else a 404.
+/// A chat request naming [`LIMITED_MODEL`] is answered 429 with `Retry-After`,
+/// and one naming [`LOCKED_MODEL`] 401: the fake origin the `fails_under`
+/// probes ask (ledger #1546).
 fn respond(method: &str, path: &str, request: &[u8]) -> (u16, &'static str, Vec<u8>) {
     let ok = |body: &str| (200, "OK", body.as_bytes().to_vec());
+    let named = serde_json::from_slice::<serde_json::Value>(request)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_string));
     match (method, path) {
+        ("POST", "/v1/chat/completions") if named.as_deref() == Some(LIMITED_MODEL) => (
+            429,
+            "Too Many Requests",
+            br#"{"error":{"message":"rate limit reached","type":"rate_limit"}}"#.to_vec(),
+        ),
+        ("POST", "/v1/chat/completions") if named.as_deref() == Some(LOCKED_MODEL) => (
+            401,
+            "Unauthorized",
+            br#"{"error":{"message":"invalid api key","type":"auth"}}"#.to_vec(),
+        ),
         ("POST", "/v1/chat/completions") => ok(&format!(
             r#"{{"model":"{MODEL}","choices":[{{"message":{{"role":"assistant","content":"Hello there!"}},"finish_reason":"stop"}}],"usage":{{"total_tokens":7}}}}"#
         )),
@@ -427,6 +455,9 @@ fn walk(suite: Suite, registry: Registry) -> Report {
             CONFIG_THREAD_IS_ITS_OWN_NAME,
         )
         .host_named_space(SPACE_LABEL, space)
+        // FAILURES (conformance 0.10.0, opt-in until 0.11): every action is held to
+        // the failure classes it declares (ledger #1546).
+        .check_failures()
         .run_blocking(&kernel)
 }
 
@@ -536,12 +567,48 @@ fn conforms_without_discovery() {
 #[test]
 fn conforms() {
     let stub = Stub::start();
-    let report = walk(suite().cacheable("llm-ollama-model"), pinned(&stub));
+    let report = walk(
+        origin_failures(suite().cacheable("llm-ollama-model")),
+        pinned(&stub),
+    );
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report, 1);
     assert_eq!(report.declared.cacheable, ["llm-ollama-model"], "{report}");
-    assert_stub_footprint(&stub, 2);
+    // One ask per action, and one per `fails_under` probe.
+    assert_stub_footprint(&stub, 2 + ORIGIN_PROBES);
+    assert_origin_failures(&report);
+}
+
+/// How many `fails_under` probes [`origin_failures`] adds: two classes, two asks.
+const ORIGIN_PROBES: usize = 4;
+
+/// Each ask, the facade's and the backend's, under a fake origin answering 429
+/// and one answering 401: it must fail as `retry-after` and `refused`, the classes
+/// it declares (ledger #1546). The model name is what the stub keys on.
+fn origin_failures(suite: Suite) -> Suite {
+    ["llm-ask", "llm-ollama-ask"]
+        .into_iter()
+        .fold(suite, |suite, id| {
+            suite
+                .fails_under(
+                    Fixture::new(id, Verb::Source).arg("model", LIMITED_MODEL),
+                    FailureClass::RetryAfter,
+                )
+                .fails_under(
+                    Fixture::new(id, Verb::Source).arg("model", LOCKED_MODEL),
+                    FailureClass::Refused,
+                )
+        })
+}
+
+/// Every probe [`origin_failures`] declared ran, and failed with its class.
+fn assert_origin_failures(report: &Report) {
+    let probes = &report.declared.evidence.fails_under;
+    assert_eq!(probes.len(), ORIGIN_PROBES, "{report}");
+    for probe in probes {
+        assert_eq!(probe.got, Some(probe.expected), "{report}");
+    }
 }
 
 #[test]
