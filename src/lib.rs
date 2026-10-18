@@ -160,6 +160,10 @@ pub struct OpenAiConfig {
     /// from the backend on each resolve (see [`OpenAiConfig::discovering`]).
     pub default_model: Option<String>,
     /// Bearer token, if the endpoint needs one. Local runtimes usually don't.
+    /// It must be an RFC 6750 §2.1 `b64token` (letters, digits and `-._~+/`, then
+    /// any `=`), as every provider-issued key is: [`Registry::from_json`] refuses
+    /// one that is not, and so does every request to a provider built in code
+    /// with one, before anything is sent. Neither refusal quotes the key.
     pub api_key: Option<String>,
     /// The declared capability profile (what `urn:llm:models` reports and
     /// selection will reason over). Empty by default.
@@ -238,7 +242,8 @@ impl Registry {
     /// **Refused at load**, naming what is wrong rather than loading a registry
     /// that misroutes in silence: an unknown key at any level (`batchat`,
     /// `modle`), a `cost` outside `local` | `cheap` | `premium`, `batchAt: 0`,
-    /// and a `default` that names no configured provider.
+    /// an `api_key` that is not an RFC 6750 Bearer token (named by provider, the
+    /// key never quoted), and a `default` that names no configured provider.
     pub fn from_json(json: &str) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -298,6 +303,14 @@ impl Registry {
                 bad.provider,
                 bad.caps.cost.as_deref().unwrap_or_default()
             )));
+        }
+        // A key that is not a Bearer token would load, then fail every request to
+        // its provider (or, before ledger #1874, ride a CR/LF into a second
+        // header). Refused here the same, naming the provider and the rule only.
+        for p in &providers {
+            if let Some(key) = &p.api_key {
+                bearer(&p.provider, key)?;
+            }
         }
         // A default naming no provider would load, fail every unrouted ask, and
         // have the trait graph assert a route to a backend that does not exist.
@@ -669,7 +682,7 @@ impl Endpoint for OpenAiBackend {
             payload["max_tokens"] = json!(m);
         }
 
-        let headers = provider_headers(&self.config, true);
+        let headers = provider_headers(&self.config, true)?;
         let mut response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
         let mut answered_by = model;
 
@@ -1364,7 +1377,7 @@ async fn discovered_caps(
         .send(HttpRequest {
             method: Method::Post,
             url,
-            headers: provider_headers(provider, true),
+            headers: provider_headers(provider, true).ok()?,
             body,
         })
         .await
@@ -2101,7 +2114,9 @@ async fn annotate_capabilities(
     if !may_reach(inv, &parsed) {
         return;
     }
-    let headers = provider_headers(config, true);
+    let Ok(headers) = provider_headers(config, true) else {
+        return;
+    };
     for m in models.iter_mut() {
         let Ok(response) = post_json(transport, &url, &headers, &json!({ "model": m.model })).await
         else {
@@ -2187,7 +2202,7 @@ async fn get(
         .send(HttpRequest {
             method: Method::Get,
             url: url.clone(),
-            headers: provider_headers(config, false),
+            headers: provider_headers(config, false)?,
             body: Vec::new(),
         })
         .await
@@ -2373,15 +2388,37 @@ fn may_reach(inv: &Invocation<'_>, url: &url::Url) -> bool {
 /// the chat call sent the key while the listing, liveness and `/api/show` calls
 /// sent nothing, so a keyed provider read as down and a keyed discovering
 /// provider could not answer at all.
-fn provider_headers(config: &OpenAiConfig, json_body: bool) -> Vec<(String, String)> {
+///
+/// A key that is not an RFC 6750 `b64token` is refused here, before any request
+/// is built, so a configured key carrying a CR/LF can never become a second header
+/// at a transport that does not police header bytes.
+fn provider_headers(config: &OpenAiConfig, json_body: bool) -> Result<Vec<(String, String)>> {
     let mut headers = Vec::new();
     if json_body {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
     }
     if let Some(key) = &config.api_key {
-        headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        headers.push(("Authorization".to_string(), bearer(&config.provider, key)?));
     }
-    headers
+    Ok(headers)
+}
+
+/// The `Authorization` value for `provider`'s key: the ecosystem's one Bearer
+/// builder (`ikigai_http::auth`, RFC 6750 §2.1), not a hand-formatted string. Every
+/// key an LLM provider issues fits `b64token` (letters, digits and `-._~+/`, then
+/// `=`); a key an operator chose for a local server must fit it too. The refusal
+/// names the provider and the rule, never the key: `urn:llm:config` and every error
+/// face answer under no capability at all.
+fn bearer(provider: &str, key: &str) -> Result<String> {
+    ikigai_http::auth::bearer(key)
+        .map(ikigai_http::auth::Authorization::into_string)
+        .map_err(|e| {
+            Error::Endpoint(format!(
+                "urn:llm:config: provider `{provider}` has an api_key that is not a Bearer \
+                 token ({}): {e}",
+                e.code()
+            ))
+        })
 }
 
 /// The `user:password` part of a URL's authority, if it has one — taken from the
@@ -2639,6 +2676,85 @@ mod tests {
             .unwrap();
         assert_eq!(remote.default_model.as_deref(), Some("gpt-4o"));
         assert_eq!(remote.api_key.as_deref(), Some("sk-SECRET"));
+    }
+
+    /// A keyed provider built in code (a pub struct, so `from_json` is not the only
+    /// door): the same local server, a key of the caller's choosing.
+    fn keyed(key: &str) -> OpenAiConfig {
+        OpenAiConfig {
+            api_key: Some(key.to_string()),
+            ..OpenAiConfig::ollama("llama3.1")
+        }
+    }
+
+    #[test]
+    fn a_key_is_sent_as_one_rfc6750_bearer_credential() {
+        // Every character RFC 6750's b64token allows, then trailing `=`: the shapes
+        // OpenAI (`sk-proj-…`), Anthropic (`sk-ant-api03-…`), Groq (`gsk_…`),
+        // OpenRouter (`sk-or-v1-…`) and Gemini (`AIza…`) issue all fall inside it.
+        let key = "sk-proj-Ab_9.x~y+z/0==";
+        let mock = MockTransport::new(CANNED);
+        let kernel = Kernel::new(Arc::new(space(Arc::clone(&mock) as _, keyed(key))));
+        block_on(kernel.issue(ask("urn:llm:ollama:ask", "hi"), &Capability::root())).unwrap();
+        let sent = mock.last.lock().unwrap().clone().unwrap();
+        let auth: Vec<&str> = sent
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(auth, ["Bearer sk-proj-Ab_9.x~y+z/0=="]);
+    }
+
+    #[test]
+    fn a_key_outside_b64token_is_refused_at_load_without_echoing_it() {
+        // A CR/LF in a configured key used to go straight into the header value, so
+        // a transport that does not police header bytes would send a second,
+        // attacker-shaped header. A space or a quote breaks the credential too.
+        for key in ["sk-a\\r\\nX-Injected: 1", "sk has space", "sk\\\"q", ""] {
+            let json = format!(
+                r#"{{ "default": "remote", "providers": {{
+                    "remote": {{ "base_url": "https://api.example.com/v1",
+                                 "model": "gpt-4o", "api_key": "{key}" }} }} }}"#
+            );
+            let err = Registry::from_json(&json).expect_err(key).to_string();
+            assert!(err.contains("`remote`"), "names the provider: {err}");
+            assert!(err.contains("bearer-token-syntax"), "names the rule: {err}");
+            // The key itself never appears, in any spelling the parse produced.
+            let parsed: String = serde_json::from_str(&format!("\"{key}\"")).unwrap();
+            if !parsed.is_empty() {
+                assert!(!err.contains(&parsed), "the key leaked: {err}");
+            }
+            for fragment in ["Injected", "has space", "sk\"q"] {
+                assert!(
+                    !err.contains(fragment),
+                    "a fragment of the key leaked: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_key_built_in_code_never_reaches_the_transport() {
+        let secret = "sk-SECRET with\r\nX-Injected: 1";
+        let mock = MockTransport::new(CANNED);
+        let kernel = Kernel::new(Arc::new(space(Arc::clone(&mock) as _, keyed(secret))));
+        for target in ["urn:llm:ollama:ask", "urn:llm:ollama:installed"] {
+            let req = if target.ends_with(":ask") {
+                ask(target, "hi")
+            } else {
+                Request::new(Verb::Source, Iri::parse(target).unwrap())
+            };
+            let err = block_on(kernel.issue(req, &Capability::root()))
+                .expect_err(target)
+                .to_string();
+            assert!(err.contains("bearer-token-syntax"), "{target}: {err}");
+            assert!(!err.contains("SECRET"), "{target}: the key leaked: {err}");
+            assert!(
+                mock.last.lock().unwrap().is_none(),
+                "{target}: a request carrying the bad key was sent"
+            );
+        }
     }
 
     #[test]

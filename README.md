@@ -87,6 +87,13 @@ load-time form of "the logical config aliases to file-or-code"):
 }
 ```
 
+An `api_key` goes out as `Authorization: Bearer <key>`, built by
+`ikigai_http::auth::bearer`, so it must be an RFC 6750 `b64token`: letters,
+digits and `-._~+/`, then any number of `=`. Every key the hosted providers
+issue fits (`sk-proj-…`, `sk-ant-…`, `gsk_…`, `AIza…`). A key you choose for a
+local vLLM or `llama.cpp` server must fit too: one with a space, a quote or a
+line break is refused when the file loads, naming the provider and never the key.
+
 ### `model` is optional: name the server, not the model
 An entry that **omits `model`** (like `rapid` above) names the **server**. The
 model is discovered from the backend per resolve, so swapping the model behind

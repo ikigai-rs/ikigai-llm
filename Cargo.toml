@@ -22,7 +22,8 @@ categories = ["web-programming"]
 # (its `space()` returns core's `Alias` overlay), so no graph with http 0.2 can resolve
 # lower. The newest core API this crate calls itself is older: 0.1.48 =
 # Invocation::trace_note (model-tier span labels). Checked 2026-10-17 by a fresh
-# resolve of src/ alone at ikigai-core =0.1.86 and ikigai-http =0.2.0: it compiles.
+# resolve of src/ alone at ikigai-core =0.1.86 and ikigai-http =0.2.0: it compiles
+# (ikigai-http 0.2.1, the floor since ledger #1874, keeps that core floor).
 # The TESTS never see it: ikigai-conformance 0.8 (dev) requires core 0.1.100, so the
 # test graph unifies on that. A ceiling too: "0.1.86" admits every later 0.1.x and no 0.2.
 ikigai-core = "0.1.86"
@@ -36,9 +37,12 @@ ikigai-core = "0.1.86"
 # part of THIS crate's public API (`space(transport, ..)`), and a host shares one
 # transport between http's space and this one, so both must name the same
 # ikigai-http: moving this pin is breaking for consumers, hence llm 0.15.0. A ceiling
-# too: "0.2.0" admits 0.2.x only, and 0.3.0 (which drops the deprecated aliases) is a
-# deliberate pin change.
-ikigai-http = "0.2.0"
+# too: "0.2.1" admits 0.2.x only, and 0.3.0 (which drops the deprecated aliases) is a
+# deliberate pin change. The floor is 0.2.1 because `auth::bearer` (the ecosystem's
+# one RFC 6750 Bearer builder, ledger #1857) first ships there; this crate builds its
+# Authorization header with it (ledger #1874). Same 0.2 range, so consumers sharing a
+# transport are not moved.
+ikigai-http = "0.2.1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
