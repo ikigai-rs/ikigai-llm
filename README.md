@@ -370,6 +370,40 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.16.0 (2026-10-18)
+
+Minor, **BREAKING for hosts and for callers matching error variants** (ledger
+#1546).
+
+- **BREAKING for hosts: `ikigai-http` moves to 0.3.0.** `space(transport,
+  registry)` takes an `Arc<dyn ikigai_http::HttpTransport>`, and a host shares
+  one transport between `ikigai-http`'s space and this one, so both must name
+  the same `ikigai-http`: move it to 0.3 with this release. The `ikigai-core`
+  floor moves 0.1.86 → 0.1.108.
+- **Every failure is typed by `ikigai-http`'s one status table**
+  (`ikigai_http::status`). This crate's own copy is deleted; it had drifted. A
+  caller matching an old variant now sees a new one:
+  - an origin's **401/403** is `Refused` (was `Endpoint`), **404** is
+    `NotFound` (was `Endpoint`), 409/412 `Conflict`, 413/414/431 `OverBudget`,
+    501 `Unsupported` (all were `Endpoint` or `Unavailable`);
+  - **429** is `RetryAfter`, carrying the `Retry-After` delay when the header
+    parses (was `Unavailable`). It is **not transient**: an overlay built on
+    `is_transient` no longer re-issues straight into the limit, and one reading
+    `Error::class` waits out the delay when its deadline allows. A 503 with
+    `Retry-After` is `RetryAfter` too;
+  - **500** and the other 5xx but 502, 503 and 504 are `Endpoint`, class
+    unknown (were `Unavailable`): they are **no longer retried**. 502, a 503
+    without a usable delay, 408/504 and a request that got no answer are
+    unchanged.
+- **Rewording keeps the type.** A discovering provider's
+  `could not discover a model at …` now keeps `Refused`, `RetryAfter` (with its
+  delay), `OverBudget`, `NotFound`, `Conflict` and `Unsupported`; `NotFound`
+  and `Conflict` used to become `Endpoint`.
+- **Every action declares its failure classes** (`Description::fails`), so the
+  manifold and an agent's retry plan read them from the contract. The
+  conformance test (ikigai-conformance 0.10.0) holds each action to them, and
+  probes each ask against a fake origin's 429 and 401.
+
 ## 0.15.1 (2026-10-18)
 
 Patch: no public API changes, and the dependency floor stays inside the same
