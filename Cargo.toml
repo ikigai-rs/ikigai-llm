@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 # The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
 # on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
