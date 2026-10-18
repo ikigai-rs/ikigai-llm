@@ -355,6 +355,23 @@ as text, so a timeout is recognized by its words (`timed out`, `timeout`);
 anything else unanswered is `Unavailable`. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.15.1 (2026-10-18)
+
+Patch: no public API changes, and the dependency floor stays inside the same
+ranges.
+
+- **The `Authorization` header is built by `ikigai_http::auth::bearer`**
+  (ledger #1874), the ecosystem's one RFC 6750 builder, rather than by hand.
+  The `ikigai-http` floor moves 0.2.0 → 0.2.1, where that builder first ships;
+  same 0.2 range, so a host sharing one transport is not moved.
+- **An `api_key` that is not a `b64token` is refused**: at
+  `Registry::from_json`, and on every request for an `OpenAiConfig` built in
+  code, before anything reaches the transport. The error names the provider
+  and the rule code (`bearer-token-syntax`), never the key. Before, a CR/LF in
+  a key went into the header value unchecked. Every hosted provider's issued
+  key fits. A key an operator chose for a local vLLM or `llama.cpp` server
+  with a space or a quote in it is now refused, and has to be changed.
+
 ## 0.15.0 (2026-10-17)
 
 - **BREAKING for hosts: `ikigai-http` moves to 0.2.0** (the naming wave,
