@@ -13,7 +13,7 @@ addressable (`urn:llm:<provider>:ask`).
   and LM Studio** — they differ only in `base_url`, `default_model`, and whether a
   key is needed.
 
-Buffered (no streaming yet), single-turn, `urn:cap:net`-gated. The gate judges
+Single-turn, `urn:cap:net`-gated; text completions support streaming bodies. The gate judges
 host, **port** and path exactly as `ikigai-http`'s own endpoints do: a grant on
 `urn:cap:net:localhost:8000` reaches the MLX server on 8000 and not Ollama on
 11434, and a deny on one port refuses only that port. Generation is
@@ -47,6 +47,30 @@ parameters are ignored and case is folded, so `as=application/json;
 charset=utf-8` is the JSON face, and a face the endpoint does not declare
 (`application/ld+json`, `text/turtle` on an ask) is refused before any request
 is sent, never answered with something else.
+
+### Streaming completions
+
+`Kernel::issue_body` returns text completions as `Body::Once`, forwarding tokens
+as the server sends them. Both Ollama and mlx-lm use their OpenAI-compatible
+`/v1/chat/completions` API with `stream: true`. Dropping the body cancels further
+reads. A provider must send `[DONE]`: EOF or a dropped connection before it is
+`Unavailable`, including after some tokens have arrived. Malformed events and
+in-band provider errors also fail the body; readers must discard partial answers
+on any error. The UTF-8 and SSE framing come from `eventsource-stream`, and JSON
+is parsed by `serde_json`.
+
+The feed has no total length limit. Reads are at most 8 KiB, with a 64 KiB bound
+on wire bytes consumed without a dispatched SSE event, including unterminated
+lines and comment-only responses. Exceeding that bound is `OverBudget`.
+`Kernel::issue` collects the body under the run's shared byte budget and refuses
+with `OverBudget` rather than returning a shortened answer. Core checks the
+run's deadline on arriving chunks, including the final completion marker;
+heartbeat and idle-time enforcement are separate work (ledger #2262).
+
+Direct `Endpoint::invoke` retains the buffered `stream: false` request and 8 MiB
+HTTP bound. The `as=application/json` envelope also stays buffered, preserving
+its model, finish reason and usage fields. A server that ignores `stream: true`
+and answers a JSON document is still supported under the existing HTTP bound.
 
 ### Mounting it
 The host injects an [`ikigai_http::HttpTransport`] (the same seam `ikigai-http`
@@ -370,6 +394,25 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.17.1 (unreleased)
+
+Patch, additive (ledger #2250).
+
+- Add live `Body::Once` text completions beside the buffered `invoke` path,
+  through the facade and each OpenAI-compatible provider, including Ollama and
+  mlx-lm. Preserve provider selection, model discovery/fallback, authentication,
+  network capability checks, tracing and the JSON envelope face.
+- Decode SSE and UTF-8 incrementally with `eventsource-stream`; require `[DONE]`
+  and propagate a terminal error on disconnect, malformed events or provider
+  errors. Bound pending event framing to 64 KiB; overflow, run memory-budget
+  overflow on collection, and run deadlines refuse with `OverBudget`.
+- Raise the core floor to 0.2.1 within the existing 0.2.x caret range. No API
+  break or publication. Heartbeat and idle limits remain ledger #2262.
+- Add transport-counted tests for early tokens/cancellation, an unbounded lazy
+  producer, a feed larger than 8 MiB, byte/body parity, framing, failure classes,
+  budgets and deadlines. Conformance 0.12.0 is not published yet, so 0.11.0 stays
+  pinned and body parity is tested directly.
+
 ## 0.17.0 (unreleased)
 
 Minor, **BREAKING for hosts** (the core 0.2.0 sweep, ledger #2261).
@@ -564,4 +607,4 @@ hierarchy; `ik:Vision ⊑ ik:Multimodal`), **live-reload** (make `urn:llm:config
 live resource that sources the file under a golden thread), **transrepted config**
 (author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,
 deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX (pyo3),
-streaming, and `urn:llm:embed`.
+heartbeat/idle limits for live feeds, and `urn:llm:embed`.
