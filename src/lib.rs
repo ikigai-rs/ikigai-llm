@@ -18,8 +18,10 @@
 //! Ollama, vLLM, `llama.cpp`'s server, `mlx_lm.server`, and LM Studio — they
 //! differ only in `base_url`, `default_model`, and whether a key is needed. The
 //! facade already dispatches by provider, so more backends slot in behind the
-//! same front grammar without changing it. Buffered (no streaming yet),
-//! single-turn, `urn:cap:net`-gated. Generation is non-deterministic, so results
+//! same front grammar without changing it. Single-turn, `urn:cap:net`-gated.
+//! The text body path streams OpenAI-compatible SSE deltas as a one-shot body;
+//! bytes callers collect under the run's budget. The JSON envelope stays buffered.
+//! Generation is non-deterministic, so results
 //! are uncacheable by default (deterministic caching is a later slice).
 
 use std::collections::BTreeMap;
@@ -28,12 +30,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation, Iri,
-    ReprType, Representation, Request, Result, Verb,
+    ArgSpec, Body, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation,
+    Iri, ReprType, Representation, Request, Result, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method, DEFAULT_MAX_RESPONSE_BYTES};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+mod streaming;
 
 /// The capability every backend call requires — reaching a server, even on
 /// localhost, is a network act. Declared in the **wildcard form** (the
@@ -547,9 +551,8 @@ impl AskFacade {
     }
 }
 
-#[async_trait]
-impl Endpoint for AskFacade {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl AskFacade {
+    async fn route(&self, inv: &Invocation<'_>) -> Result<Request> {
         // Explicit `provider=` wins; then `needs=` (capability-based selection);
         // then the configured default.
         // Both routing inputs are read strictly: one supplied in a form this
@@ -571,12 +574,20 @@ impl Endpoint for AskFacade {
         };
         let target = Iri::parse(format!("urn:llm:{provider}:ask"))
             .map_err(|e| Error::Endpoint(format!("urn:llm:ask: bad provider `{provider}`: {e}")))?;
-        // Rewrite the target; carry every argument through unchanged. Going via
-        // `inv.issue` records the backend result as a dependency, so its expiry
-        // and golden threads propagate to this facade result.
         let mut req = Request::new(Verb::Source, target);
         req.args = inv.request.args.clone();
-        inv.issue(req).await
+        Ok(req)
+    }
+}
+
+#[async_trait]
+impl Endpoint for AskFacade {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.issue(self.route(inv).await?).await
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        inv.issue_body(self.route(inv).await?).await
     }
 
     fn name(&self) -> &str {
@@ -625,6 +636,32 @@ impl OpenAiBackend {
 #[async_trait]
 impl Endpoint for OpenAiBackend {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // answer(false) only constructs Bytes, after receive's existing HTTP
+        // bound. Do not impose a second bound on the normalized JSON envelope.
+        Ok(self.answer(inv, false).await?.map_body(|body| match body {
+            Body::Bytes(bytes) => bytes.to_vec(),
+            _ => unreachable!("a buffered completion cannot return a stream"),
+        }))
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        self.answer(inv, true).await
+    }
+
+    fn name(&self) -> &str {
+        "llm-openai"
+    }
+
+    fn describe(&self) -> Description {
+        ask_description(
+            &format!("llm-{}-ask", self.config.provider),
+            "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
+        )
+    }
+}
+
+impl OpenAiBackend {
+    async fn answer(&self, inv: &Invocation<'_>, streaming: bool) -> Result<Representation<Body>> {
         // Reaching a server — even localhost — is a network act, gated per-host by
         // the same capability convention ikigai-http uses (urn:cap:net:<host>).
         let url = require_net(
@@ -650,6 +687,7 @@ impl Endpoint for OpenAiBackend {
             .map(parse_max_tokens)
             .transpose()?;
         let face = requested_face(inv, &TEXT_OR_JSON)?;
+        let streaming = streaming && face != "application/json";
 
         // `model=` wins verbatim — always, for a discovering provider too: the
         // caller named a model, and naming one is never a request to go looking.
@@ -674,7 +712,7 @@ impl Endpoint for OpenAiBackend {
         }
         messages.push(json!({ "role": "user", "content": prompt }));
 
-        let mut payload = json!({ "model": model, "messages": messages, "stream": false });
+        let mut payload = json!({ "model": model, "messages": messages, "stream": streaming });
         if let Some(t) = temperature {
             payload["temperature"] = json!(t);
         }
@@ -683,7 +721,7 @@ impl Endpoint for OpenAiBackend {
         }
 
         let headers = provider_headers(&self.config, true)?;
-        let mut response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+        let mut response = post_response(self.transport.as_ref(), &url, &headers, &payload).await?;
         let mut answered_by = model;
 
         // The configured DEFAULT model may not exist on this machine's server
@@ -710,7 +748,8 @@ impl Endpoint for OpenAiBackend {
             if let Some(first) = fallback {
                 if first != answered_by {
                     payload["model"] = json!(first);
-                    response = post_json(self.transport.as_ref(), &url, &headers, &payload).await?;
+                    response =
+                        post_response(self.transport.as_ref(), &url, &headers, &payload).await?;
                     answered_by = first;
                 }
             }
@@ -727,6 +766,7 @@ impl Endpoint for OpenAiBackend {
         }
 
         if response.status >= 400 {
+            let response = receive(response).await?;
             let caller_text: Vec<&str> = std::iter::once(prompt).chain(system).collect();
             return Err(status_failure(
                 inv,
@@ -739,6 +779,19 @@ impl Endpoint for OpenAiBackend {
             ));
         }
 
+        if streaming
+            && response
+                .header("content-type")
+                .is_some_and(|kind| media_type_essence(Some(kind)) == "text/event-stream")
+        {
+            return Ok(Representation::from_body(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                crate::streaming::completion(response.body),
+            ));
+        }
+        // A server may ignore stream=true and answer one JSON document. Preserve
+        // that compatibility, still using the HTTP collector's existing bound.
+        let response = receive(response).await?;
         let parsed: Value = serde_json::from_slice(&response.body)
             .map_err(|e| Error::Endpoint(format!("llm: response was not JSON: {e}")))?;
         let choice = &parsed["choices"][0];
@@ -758,24 +811,15 @@ impl Endpoint for OpenAiBackend {
             Ok(Representation::new(
                 ReprType::new("application/json").with_param("charset", "utf-8"),
                 serde_json::to_vec(&envelope).unwrap_or_default(),
-            ))
+            )
+            .into_body())
         } else {
             Ok(Representation::new(
                 ReprType::new("text/plain").with_param("charset", "utf-8"),
                 text.as_bytes().to_vec(),
-            ))
+            )
+            .into_body())
         }
-    }
-
-    fn name(&self) -> &str {
-        "llm-openai"
-    }
-
-    fn describe(&self) -> Description {
-        ask_description(
-            &format!("llm-{}-ask", self.config.provider),
-            "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
-        )
     }
 }
 
@@ -1016,12 +1060,15 @@ fn ask_description(id: &str, summary: &str) -> Description {
 /// argument) and `denied` (beside the declared `urn:cap:net:*`).
 ///
 /// - `transient`: no answer (a refused connection, a DNS failure, a timeout), a 502, a
-///   503 without a delay, a 408 or 504;
+///   503 without a delay, a 408 or 504, or a completion stream ending before `[DONE]`;
 /// - `retry-after`: a 429, or a 503 carrying `Retry-After`;
-/// - `over-budget`: a 413, 414 or 431 (the prompt was too large for the server), or an
-///   answer over [`DEFAULT_MAX_RESPONSE_BYTES`] (see [`receive`]);
-/// - `refused`: a 401 or 403 (the server refused the configured key);
-/// - `unknown`: a 500 or other 5xx, an answer that is not the JSON this crate reads.
+/// - `over-budget`: a 413, 414 or 431 (the prompt was too large for the server), a
+///   buffered answer over [`DEFAULT_MAX_RESPONSE_BYTES`] (see [`receive`]), a live
+///   event over its framing limit, collection past the run's byte pool, or a live
+///   body past its run's deadline;
+/// - `refused`: a 401 or 403 (the server refused the configured key), or a refusal delta;
+/// - `unknown`: a 500 or other 5xx, malformed JSON/SSE, a non-text delta, or an
+///   in-band streaming error. Provider text is never quoted from streaming errors.
 const ORIGIN_FAILURES: [FailureClass; 5] = [
     FailureClass::Transient,
     FailureClass::RetryAfter,
@@ -1892,9 +1939,18 @@ async fn post_json(
     headers: &[(String, String)],
     payload: &Value,
 ) -> Result<Reply> {
+    receive(post_response(transport, url, headers, payload).await?).await
+}
+
+async fn post_response(
+    transport: &dyn HttpTransport,
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+) -> Result<HttpResponse> {
     let body = serde_json::to_vec(payload)
         .map_err(|e| Error::Endpoint(format!("llm: encoding request failed: {e}")))?;
-    let response = transport
+    transport
         .send(HttpRequest {
             method: Method::Post,
             url: url.to_string(),
@@ -1902,13 +1958,12 @@ async fn post_json(
             body,
         })
         .await
-        .map_err(|e| transport_failure(&e, url))?;
-    receive(response).await
+        .map_err(|e| transport_failure(&e, url))
 }
 
 /// A provider's answer with its body collected. ikigai-http 0.4.0 hands a response
-/// body over as a stream ([`ikigai_http::HttpBody`], ledger #2261); every answer this
-/// crate reads is one JSON document, so it is read whole, but never more than
+/// body over as a stream ([`ikigai_http::HttpBody`], ledger #2261). Non-streaming
+/// answers are one JSON document, read whole, but never more than
 /// [`DEFAULT_MAX_RESPONSE_BYTES`], ikigai-http's own endpoint limit.
 struct Reply {
     status: u16,
@@ -2718,7 +2773,7 @@ mod tests {
         assert_eq!(sent.url, "http://localhost:11434/v1/chat/completions");
         let body: Value = serde_json::from_slice(&sent.body).unwrap();
         assert_eq!(body["model"], "llama3.1");
-        assert_eq!(body["stream"], false);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hi");
     }
