@@ -18,30 +18,51 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
-use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+use ikigai_core::{
+    ArgRef, Capability, Error, FailureClass, Iri, Kernel, Representation, Request, Verb,
+};
+use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, DEFAULT_MAX_RESPONSE_BYTES};
 use ikigai_llm::{space, OpenAiConfig, Registry};
 
-struct Stub(HttpResponse);
+struct Stub {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
 
 #[async_trait]
 impl HttpTransport for Stub {
     async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, String> {
-        Ok(self.0.clone())
+        Ok(HttpResponse {
+            status: self.status,
+            headers: self.headers.clone(),
+            body: self.body.clone().into(),
+        })
     }
 }
 
 /// The error text `urn:llm:ollama:ask` (model pinned, so no fallback probe)
 /// reports when the backend answers `status` with `body` under `content_type`.
 fn error_for(status: u16, content_type: Option<&str>, body: &[u8]) -> String {
+    answer_for(status, content_type, body)
+        .expect_err("a 4xx/5xx must be an error")
+        .to_string()
+}
+
+/// What `urn:llm:ollama:ask` answers when the backend replies `status` with `body`.
+fn answer_for(
+    status: u16,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Representation, Error> {
     let headers = content_type
         .map(|ct| vec![("Content-Type".to_string(), ct.to_string())])
         .unwrap_or_default();
-    let stub: Arc<dyn HttpTransport> = Arc::new(Stub(HttpResponse {
+    let stub: Arc<dyn HttpTransport> = Arc::new(Stub {
         status,
         headers,
         body: body.to_vec(),
-    }));
+    });
     let kernel = Kernel::new(Arc::new(space(
         stub,
         Registry::single(OpenAiConfig::ollama("m")),
@@ -50,8 +71,6 @@ fn error_for(status: u16, content_type: Option<&str>, body: &[u8]) -> String {
         .with_arg("prompt", ArgRef::Inline(b"hi".to_vec()))
         .with_arg("model", ArgRef::Inline(b"m".to_vec()));
     futures::executor::block_on(kernel.issue(request, &Capability::root()))
-        .expect_err("a 4xx/5xx must be an error")
-        .to_string()
 }
 
 const NGINX_502: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n\
@@ -129,6 +148,32 @@ fn a_json_error_keeps_its_reason() {
     );
     assert!(
         err.contains(r#"llm backend returned 404: model "m" not found, try pulling it first"#),
+        "{err}"
+    );
+}
+
+/// ikigai-http 0.4.0 hands a body over as a stream (ledger #2261), and this crate
+/// reads at most [`DEFAULT_MAX_RESPONSE_BYTES`] of it: a larger answer is
+/// `OverBudget`, never a buffer as large as the origin cares to send.
+#[test]
+fn an_answer_over_the_limit_is_over_budget() {
+    let body = vec![b' '; DEFAULT_MAX_RESPONSE_BYTES + 1];
+    let err = answer_for(200, Some("application/json"), &body).unwrap_err();
+    assert_eq!(err.class(), FailureClass::OverBudget, "{err}");
+}
+
+/// An error answer over the limit keeps its status's class: a body too large to
+/// read is described, and never hides that the backend was down.
+#[test]
+fn an_error_body_over_the_limit_keeps_the_status() {
+    let body = vec![b' '; DEFAULT_MAX_RESPONSE_BYTES + 1];
+    let err = answer_for(502, Some("application/json"), &body).unwrap_err();
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+    assert!(
+        err.to_string().contains(&format!(
+            "llm backend returned 502: unread error body (application/json, over \
+             {DEFAULT_MAX_RESPONSE_BYTES} bytes or unreadable)"
+        )),
         "{err}"
     );
 }

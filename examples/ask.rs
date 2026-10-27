@@ -10,12 +10,12 @@
 //! to a real server. It uses a blocking `ureq` transport so it needs no async
 //! runtime and touches nothing in the shipped crate.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::io::AllowStdIo;
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
-use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+use ikigai_http::{HttpBody, HttpRequest, HttpResponse, HttpTransport};
 use ikigai_llm::{space, OpenAiConfig};
 
 /// A minimal blocking transport — exactly the seam a native host fills with
@@ -29,17 +29,17 @@ impl HttpTransport for UreqTransport {
         for (k, v) in &request.headers {
             req = req.set(k, v);
         }
-        let (status, mut reader) = match req.send_bytes(&request.body) {
+        let (status, reader) = match req.send_bytes(&request.body) {
             Ok(resp) => (resp.status(), resp.into_reader()),
             Err(ureq::Error::Status(code, resp)) => (code, resp.into_reader()),
             Err(e) => return Err(e.to_string()),
         };
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body).map_err(|e| e.to_string())?;
+        // The body is handed over unread, as a stream: the crate reading it bounds
+        // how much it takes. `AllowStdIo` adapts ureq's blocking reader.
         Ok(HttpResponse {
             status,
             headers: vec![],
-            body,
+            body: HttpBody::from_reader(AllowStdIo::new(reader)),
         })
     }
 }

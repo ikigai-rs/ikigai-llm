@@ -64,7 +64,7 @@ fn reply(status: u16, body: &str) -> Result<HttpResponse, String> {
     Ok(HttpResponse {
         status,
         headers: vec![],
-        body: body.as_bytes().to_vec(),
+        body: body.as_bytes().to_vec().into(),
     })
 }
 
