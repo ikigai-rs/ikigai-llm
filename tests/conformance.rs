@@ -379,7 +379,7 @@ impl HttpTransport for Client {
         Ok(HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }
@@ -632,15 +632,21 @@ fn conforms_with_a_discovering_provider() {
 /// It is not a string check: the check PARSES the face (oxrdfio) before reading
 /// its terms, so an unparseable graph is a finding too — which is what covers
 /// the `@prefix xsd:` line the tagged `ik:batchAt` literal now needs.
+///
+/// `DATATYPES` (on by default since conformance 0.11.0) runs here too, because
+/// this is the one graph that carries `ik:batchAt`: its `rdfs:range` is
+/// `xsd:positiveInteger`, which a bare Turtle `2` (an `xsd:integer`) does not
+/// state, so the literal must stay tagged.
 #[test]
 fn a_declared_load_shape_introduces_no_undefined_term() {
     let stub = Stub::start();
     let mut registry = pinned(&stub);
     registry.providers[0].caps.batch_at = Some(2);
     let report = suite()
-        .checks(Checks::VOCABULARY)
+        .checks(Checks::VOCABULARY | Checks::DATATYPES)
         .run_blocking(&kernel(registry));
     eprintln!("{report}");
+    assert!(report.checks.contains(Check::Datatypes), "{report}");
     assert!(report.is_clean(), "{report}");
 }
 

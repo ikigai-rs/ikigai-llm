@@ -33,7 +33,7 @@ impl HttpTransport for Stub {
         Ok(HttpResponse {
             status: 200,
             headers: vec![("Content-Type".into(), "application/json".into())],
-            body: body.as_bytes().to_vec(),
+            body: body.as_bytes().to_vec().into(),
         })
     }
 }

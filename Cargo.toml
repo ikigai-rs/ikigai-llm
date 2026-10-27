@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 # The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
 # on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
@@ -23,8 +23,10 @@ categories = ["web-programming"]
 # `Unsupported`, through ikigai-http's status table), reads `Invocation::now` for an
 # HTTP-date `Retry-After`, and declares each action's failure classes with
 # `Description::fails`, all of which first ship in 0.1.108; ikigai-http 0.3.0 requires it
-# too. A ceiling as well: "0.1.108" admits every later 0.1.x and no 0.2.
-ikigai-core = "0.1.108"
+# too. 0.2.0 is the streams release (ledger #2261); the old "0.1.108" pin meant <0.2.0
+# under 0.x rules, so moving to 0.2 is deliberate. Core's types are in this crate's API,
+# so the move is breaking for consumers, hence llm 0.17.0. "0.2.0" admits 0.2.x only.
+ikigai-core = "0.2.0"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
 # client or executor baked into this crate. `net_allows_port` (since 0.1.7) is the
@@ -37,8 +39,10 @@ ikigai-core = "0.1.108"
 # copy had drifted. HttpTransport is part of THIS crate's public API
 # (`space(transport, ..)`), and a host shares one transport between http's space and
 # this one, so both must name the same ikigai-http: moving this pin from 0.2 to 0.3 is
-# breaking for consumers, hence llm 0.16.0. A ceiling too: "0.3.0" admits 0.3.x only.
-ikigai-http = "0.3.0"
+# breaking for consumers, hence llm 0.16.0. 0.4.0 is the ikigai-http release on
+# ikigai-core 0.2.0 (ledger #2261): with core on 0.2, http must be too or the graph
+# links two cores. A ceiling too: "0.4.0" admits 0.4.x only.
+ikigai-http = "0.4.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -52,10 +56,12 @@ futures = "0.3"
 # 0.10.0 brings FAILURES and `Suite::fails_under` (opt-in, turned on here: every
 # action is held to the failure classes it declares, and two probes hold the asks to
 # `retry-after` under a 429 and `refused` under a 401; ledger #1546), on top of 0.8's
-# REQUIRED, 0.7's VALIDATE and 0.6's SPACE-NAME (ledger #987). It pins ikigai-core
+# REQUIRED, 0.7's VALIDATE and 0.6's SPACE-NAME (ledger #987). 0.10 pinned ikigai-core
 # and ikigai-vocab at 0.1.108; the vocab floor is what retired this crate's own
 # `ikigai-vocab = "0.1.69"` (the `ik:batchAt` term), and the transitive pin states it.
-ikigai-conformance = "0.10.0"
+# 0.11.0 is the release on ikigai-core and ikigai-vocab 0.2.0 (the streams release,
+# ledger #2261), and turns DATATYPES and FAILURES on by default.
+ikigai-conformance = "0.11.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"

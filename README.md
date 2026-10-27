@@ -370,6 +370,26 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
+## 0.17.0 (unreleased)
+
+Minor, **BREAKING for hosts** (the core 0.2.0 sweep, ledger #2261).
+
+- **BREAKING: `ikigai-core` moves to 0.2.0**, the streams release. Core's
+  types are in this crate's API, and the old `0.1.108` pin meant `<0.2.0`, so a
+  host moves to core 0.2 with this release or links two cores.
+- **BREAKING for hosts: `ikigai-http` moves to 0.4.0**, its release on core
+  0.2.0. A transport's `HttpResponse::body` is now an `HttpBody`, a stream:
+  return a canned body with `bytes.into()`, and wrap a real client's reader
+  with `HttpBody::from_reader` instead of reading it first (the `ask` example
+  shows ureq's, through `futures::io::AllowStdIo`).
+- **A provider's answer is read to at most 8 MiB** (ikigai-http's
+  `DEFAULT_MAX_RESPONSE_BYTES`). A larger answer is `OverBudget`; an error
+  answer whose body is larger keeps its status's type, the body described as
+  unread. `urn:llm:<provider>:up` reads no body at all.
+- `ikigai-conformance` moves to 0.11.0, whose DATATYPES and FAILURES checks
+  run by default; the `ik:batchAt` graph is now held to DATATYPES as well. No
+  finding: the literal was already tagged `^^xsd:positiveInteger`.
+
 ## 0.16.0 (2026-10-18)
 
 Minor, **BREAKING for hosts and for callers matching error variants** (ledger

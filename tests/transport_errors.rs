@@ -80,7 +80,7 @@ impl HttpTransport for Ureq {
         Ok(HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }

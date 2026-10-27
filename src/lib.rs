@@ -31,7 +31,7 @@ use ikigai_core::{
     ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, FailureClass, Invocation, Iri,
     ReprType, Representation, Request, Result, Verb,
 };
-use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method};
+use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method, DEFAULT_MAX_RESPONSE_BYTES};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -798,7 +798,13 @@ impl Endpoint for OpenAiBackend {
 /// From a JSON body, `caller_text` (the prompt and system prompt) is then cut,
 /// in its raw and its JSON-escaped spelling, wherever a server echoed it. A
 /// description carries none of the server's text, so there is nothing to cut.
-fn error_detail(response: &HttpResponse, caller_text: &[&str]) -> String {
+fn error_detail(response: &Reply, caller_text: &[&str]) -> String {
+    if response.body_unread {
+        return format!(
+            "unread error body ({}, over {DEFAULT_MAX_RESPONSE_BYTES} bytes or unreadable)",
+            media_type_essence(response.header("content-type"))
+        );
+    }
     let body = &response.body;
     let detail = match serde_json::from_slice::<Value>(body) {
         Ok(v) => structured_reason(&v),
@@ -1012,7 +1018,8 @@ fn ask_description(id: &str, summary: &str) -> Description {
 /// - `transient`: no answer (a refused connection, a DNS failure, a timeout), a 502, a
 ///   503 without a delay, a 408 or 504;
 /// - `retry-after`: a 429, or a 503 carrying `Retry-After`;
-/// - `over-budget`: a 413, 414 or 431 (the prompt was too large for the server);
+/// - `over-budget`: a 413, 414 or 431 (the prompt was too large for the server), or an
+///   answer over [`DEFAULT_MAX_RESPONSE_BYTES`] (see [`receive`]);
 /// - `refused`: a 401 or 403 (the server refused the configured key);
 /// - `unknown`: a 500 or other 5xx, an answer that is not the JSON this crate reads.
 const ORIGIN_FAILURES: [FailureClass; 5] = [
@@ -1422,6 +1429,7 @@ async fn discovered_caps(
     if response.status >= 400 {
         return None;
     }
+    let response = receive(response).await.ok()?;
     let v: Value = serde_json::from_slice(&response.body).ok()?;
     let mut caps = Caps::default();
     if let Some(info) = v["model_info"].as_object() {
@@ -1883,10 +1891,10 @@ async fn post_json(
     url: &str,
     headers: &[(String, String)],
     payload: &Value,
-) -> Result<HttpResponse> {
+) -> Result<Reply> {
     let body = serde_json::to_vec(payload)
         .map_err(|e| Error::Endpoint(format!("llm: encoding request failed: {e}")))?;
-    transport
+    let response = transport
         .send(HttpRequest {
             method: Method::Post,
             url: url.to_string(),
@@ -1894,7 +1902,53 @@ async fn post_json(
             body,
         })
         .await
-        .map_err(|e| transport_failure(&e, url))
+        .map_err(|e| transport_failure(&e, url))?;
+    receive(response).await
+}
+
+/// A provider's answer with its body collected. ikigai-http 0.4.0 hands a response
+/// body over as a stream ([`ikigai_http::HttpBody`], ledger #2261); every answer this
+/// crate reads is one JSON document, so it is read whole, but never more than
+/// [`DEFAULT_MAX_RESPONSE_BYTES`], ikigai-http's own endpoint limit.
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    /// An error answer whose body was over the limit or failed mid-read: the status
+    /// still types the failure, so the body is described rather than allowed to hide it.
+    body_unread: bool,
+}
+
+impl Reply {
+    /// The first header whose name matches `name` case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Collect a response body within [`DEFAULT_MAX_RESPONSE_BYTES`]. A success whose body
+/// is too large is [`Error::OverBudget`] (a failure mid-read is ikigai-http's transport
+/// class); an error answer keeps its status, its body marked unread.
+async fn receive(response: HttpResponse) -> Result<Reply> {
+    let HttpResponse {
+        status,
+        headers,
+        body,
+    } = response;
+    let (body, body_unread) = match body.collect(DEFAULT_MAX_RESPONSE_BYTES).await {
+        Ok(body) => (body, false),
+        Err(_) if status >= 400 => (Vec::new(), true),
+        Err(e) => return Err(with_context(e, |m| format!("llm: {m}"))),
+    };
+    Ok(Reply {
+        status,
+        headers,
+        body,
+        body_unread,
+    })
 }
 
 /// A request that got no answer at all, typed by ikigai-http's one table
@@ -1940,7 +1994,7 @@ fn transport_failure(error: &str, url: &str) -> Error {
 ///         Ok(HttpResponse {
 ///             status: 429,
 ///             headers: vec![("Retry-After".into(), "30".into())],
-///             body: br#"{"error":{"message":"slow down"}}"#.to_vec(),
+///             body: br#"{"error":{"message":"slow down"}}"#.to_vec().into(),
 ///         })
 ///     }
 /// }
@@ -1959,8 +2013,14 @@ fn transport_failure(error: &str, url: &str) -> Error {
 ///     "retry after 30000 ms: rate-limited: llm backend returned 429: slow down"
 /// );
 /// ```
-fn status_failure(inv: &Invocation<'_>, response: &HttpResponse, message: String) -> Error {
-    ikigai_http::status::response_error(response, inv.now(), message.clone())
+fn status_failure(inv: &Invocation<'_>, response: &Reply, message: String) -> Error {
+    // The table reads the status and headers only; the body was collected already.
+    let head = HttpResponse {
+        status: response.status,
+        headers: response.headers.clone(),
+        body: Default::default(),
+    };
+    ikigai_http::status::response_error(&head, inv.now(), message.clone())
         // Unreachable: every caller checks `status >= 400` first. If one ever did
         // not, a success read as a failure is still a failure, never a panic.
         .unwrap_or(Error::Endpoint(message))
@@ -2152,7 +2212,7 @@ async fn installed_models(
         "models",
         &format!("urn:llm:{}:installed", config.provider),
     )?;
-    let response = get(transport, config, url).await?;
+    let response = receive(get(transport, config, url).await?).await?;
     if response.status >= 400 {
         return Err(status_failure(
             inv,
@@ -2250,7 +2310,7 @@ async fn installed_via_tags(
             parsed.host_str().unwrap_or(""),
         ));
     }
-    let response = get(transport, config, url).await?;
+    let response = receive(get(transport, config, url).await?).await?;
     if response.status >= 400 {
         return Err(status_failure(
             inv,
@@ -2409,6 +2469,7 @@ impl Endpoint for UpEndpoint {
             "models",
             &format!("urn:llm:{}:up", self.config.provider),
         )?;
+        // The status is the whole answer: the body is dropped unread.
         let alive = match get(self.transport.as_ref(), &self.config, url).await {
             Ok(response) => response.status < 400,
             Err(_) => false, // unreachable server = down, not an error
@@ -2571,18 +2632,16 @@ mod tests {
 
     /// A canned OpenAI-compatible response; records the request it was sent.
     struct MockTransport {
-        response: HttpResponse,
+        status: u16,
+        body: Vec<u8>,
         last: Mutex<Option<HttpRequest>>,
     }
 
     impl MockTransport {
         fn new(body: &str) -> Arc<Self> {
             Arc::new(MockTransport {
-                response: HttpResponse {
-                    status: 200,
-                    headers: vec![],
-                    body: body.as_bytes().to_vec(),
-                },
+                status: 200,
+                body: body.as_bytes().to_vec(),
                 last: Mutex::new(None),
             })
         }
@@ -2592,7 +2651,11 @@ mod tests {
     impl HttpTransport for MockTransport {
         async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
             *self.last.lock().unwrap() = Some(request);
-            Ok(self.response.clone())
+            Ok(HttpResponse {
+                status: self.status,
+                headers: vec![],
+                body: self.body.clone().into(),
+            })
         }
     }
 
@@ -3477,7 +3540,7 @@ mod tests {
                         .map(|(status, body)| HttpResponse {
                             status,
                             headers: vec![],
-                            body: body.as_bytes().to_vec(),
+                            body: body.as_bytes().to_vec().into(),
                         })
                         .collect(),
                 ),
