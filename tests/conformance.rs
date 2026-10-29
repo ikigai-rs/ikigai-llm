@@ -44,7 +44,8 @@
 //!   (conformance PENDING #18/#30/#47).
 //!
 //! Nothing is `pure`: every cacheable result reads the registry. No opt-outs:
-//! every action fires against the stub, and nothing is `unprobed`. `REQUIRED`
+//! every action fires against the stub. BODIES probes deterministic answers;
+//! live answers remain explicitly unprobed with the suite's volatility reason. `REQUIRED`
 //! (conformance 0.8.0) resolves each ask again without its `prompt` and
 //! selection without its `needs`, and each must be refused with a typed
 //! `MissingArgument`; the stub's `/v1/chat/completions` count proves those
@@ -454,6 +455,7 @@ fn walk(suite: Suite, registry: Registry) -> Report {
             Check::Cacheable,
             CONFIG_THREAD_IS_ITS_OWN_NAME,
         )
+        .body_space(space.clone())
         .host_named_space(SPACE_LABEL, space)
         // FAILURES (conformance 0.10.0, opt-in until 0.11): every action is held to
         // the failure classes it declares (ledger #1546).
@@ -463,9 +465,16 @@ fn walk(suite: Suite, registry: Registry) -> Report {
 
 /// The suite for this module: `llm-select` needs a `needs=` the grammar
 /// admits (the suite's `x` is a grammar error, PENDING #7/#33); everything
-/// else resolves with the minimal inputs its ArgSpecs allow.
+/// else resolves with the minimal inputs its ArgSpecs allow. Selection also
+/// needs the concrete stub host grant: BODIES retains this caller for its bounded
+/// collect, whereas a root probe synthesizes only the declared net requirement
+/// (`urn:cap:net:*`), which does not grant access to a particular backend host.
 fn suite() -> Suite {
-    Suite::new().fixture(Fixture::new("llm-select", Verb::Source).arg("needs", "cost=local"))
+    Suite::new().fixture(
+        Fixture::new("llm-select", Verb::Source)
+            .arg("needs", "cost=local")
+            .capability(scoped(&[STUB_SCOPE])),
+    )
 }
 
 /// The four endpoints every registry binds, then four per provider.
@@ -474,9 +483,9 @@ fn endpoints(providers: usize) -> usize {
 }
 
 /// The walk saw every endpoint, one Source action each, skipped no check, left
-/// nothing unprobed, and opted nothing out. An endpoint bound without a line
-/// here is held to a weaker standard.
-fn assert_shape(report: &Report, providers: usize) {
+/// only the expected live BODIES answers unprobed, and opted nothing out.
+/// An endpoint bound without a line here is held to a weaker standard.
+fn assert_shape(report: &Report, providers: usize, live: &[&str]) {
     assert_eq!(report.endpoints, endpoints(providers), "{report}");
     assert_eq!(
         report.actions,
@@ -488,13 +497,24 @@ fn assert_shape(report: &Report, providers: usize) {
         0,
         "every check runs: {report}"
     );
-    // A check that could not observe an action reports it as `unprobed`, not as
-    // a finding, so a clean report alone does not say `REQUIRED` saw the asks
-    // refuse a missing `prompt`: this does.
-    assert!(
-        report.unprobed.is_empty(),
-        "every check observed every action: {report}"
-    );
+    // BODIES cannot compare independent calls to live answers. Pin the exact
+    // endpoints and reason: deterministic endpoints must be probed, and missing
+    // body_space wiring or a different skipped check must still fail this test.
+    let mut unprobed = Vec::new();
+    for probe in report.unprobed.iter() {
+        assert_eq!(probe.check, Check::Bodies, "{report}");
+        assert_eq!(probe.verb, Verb::Source, "{report}");
+        assert_eq!(
+            probe.reason,
+            "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)",
+            "{report}"
+        );
+        unprobed.push(probe.endpoint.as_str());
+    }
+    unprobed.sort_unstable();
+    let mut expected = live.to_vec();
+    expected.sort_unstable();
+    assert_eq!(unprobed, expected, "{report}");
     assert!(report.declared.opted_out.is_empty(), "{report}");
     assert_eq!(
         report
@@ -554,7 +574,16 @@ fn conforms_without_discovery() {
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_shape(&report, 1);
+    assert_shape(
+        &report,
+        1,
+        &[
+            "llm-ask",
+            "llm-ollama-ask",
+            "llm-ollama-up",
+            "llm-ollama-installed",
+        ],
+    );
     assert_eq!(
         report.declared.cacheable,
         ["llm-models", "llm-select", "llm-ollama-model"],
@@ -573,7 +602,18 @@ fn conforms() {
     );
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_shape(&report, 1);
+    assert_shape(
+        &report,
+        1,
+        &[
+            "llm-ask",
+            "llm-models",
+            "llm-select",
+            "llm-ollama-ask",
+            "llm-ollama-up",
+            "llm-ollama-installed",
+        ],
+    );
     assert_eq!(report.declared.cacheable, ["llm-ollama-model"], "{report}");
     // One ask per action, and one per `fails_under` probe.
     assert_stub_footprint(&stub, 2 + ORIGIN_PROBES);
@@ -617,7 +657,22 @@ fn conforms_with_a_discovering_provider() {
     let report = walk(suite(), discovering(&stub));
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_shape(&report, 2);
+    assert_shape(
+        &report,
+        2,
+        &[
+            "llm-ask",
+            "llm-models",
+            "llm-select",
+            "llm-ollama-ask",
+            "llm-ollama-up",
+            "llm-ollama-installed",
+            "llm-server-ask",
+            "llm-server-up",
+            "llm-server-installed",
+            "llm-server-model",
+        ],
+    );
     assert!(report.declared.cacheable.is_empty(), "{report}");
     assert_stub_footprint(&stub, 3);
 }
