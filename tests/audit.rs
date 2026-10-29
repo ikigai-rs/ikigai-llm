@@ -640,8 +640,18 @@ fn an_unreadable_routing_input_is_refused_not_ignored() {
         ] {
             let r = req("urn:llm:ask", &[("prompt", "hi")]).with_arg(name, value);
             let out = root(&k, r);
+            // Since core 0.2.5 the kernel settles a reference before the facade runs,
+            // so a reference to a name nothing serves is refused as `Unresolved`, naming
+            // it; a value the facade cannot read is still its own `InvalidArgument`.
+            let refused = match label {
+                "reference" => matches!(
+                    &out,
+                    Err(Error::Unresolved(iri)) if iri.as_str() == "urn:policy:no-openai"
+                ),
+                _ => matches!(out, Err(Error::InvalidArgument { .. })),
+            };
             assert!(
-                matches!(out, Err(Error::InvalidArgument { .. })),
+                refused,
                 "{name}= as {label} was not refused: {:?}",
                 out.map(|r| text(&r))
             );

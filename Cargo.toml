@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 # The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
 # on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
@@ -41,8 +41,9 @@ ikigai-core = "0.2.1"
 # this one, so both must name the same ikigai-http: moving this pin from 0.2 to 0.3 is
 # breaking for consumers, hence llm 0.16.0. 0.4.0 is the ikigai-http release on
 # ikigai-core 0.2.0 (ledger #2261): with core on 0.2, http must be too or the graph
-# links two cores. A ceiling too: "0.4.0" admits 0.4.x only.
-ikigai-http = "0.4.0"
+# links two cores. 0.5.0 is conditional revalidation (ledger #2535), which moves the
+# public HttpTransport again, hence llm 0.18.0. A ceiling too: "0.5.0" admits 0.5.x only.
+ikigai-http = "0.5.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
