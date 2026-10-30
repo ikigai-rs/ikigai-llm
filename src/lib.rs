@@ -622,6 +622,8 @@ impl Endpoint for AskFacade {
 
 /// `urn:llm:<provider>:ask` — one OpenAI-compatible chat backend over REST.
 pub struct OpenAiBackend {
+    /// `llm-<provider>-ask`: one id per bound backend (ledger #2637).
+    id: String,
     config: OpenAiConfig,
     transport: Arc<dyn HttpTransport>,
 }
@@ -629,7 +631,11 @@ pub struct OpenAiBackend {
 impl OpenAiBackend {
     /// A backend for `config`, sending over `transport`.
     pub fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
-        OpenAiBackend { config, transport }
+        OpenAiBackend {
+            id: format!("llm-{}-ask", config.provider),
+            config,
+            transport,
+        }
     }
 }
 
@@ -649,12 +655,12 @@ impl Endpoint for OpenAiBackend {
     }
 
     fn name(&self) -> &str {
-        "llm-openai"
+        &self.id
     }
 
     fn describe(&self) -> Description {
         ask_description(
-            &format!("llm-{}-ask", self.config.provider),
+            &self.id,
             "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
         )
     }
@@ -1179,13 +1185,19 @@ impl Endpoint for ConfigEndpoint {
 ///
 /// [`ikigai-browse`]: https://github.com/ikigai-rs/ikigai-browse
 pub struct ModelEndpoint {
+    /// `llm-<provider>-model`: one id per bound backend (ledger #2637).
+    id: String,
     config: OpenAiConfig,
     transport: Arc<dyn HttpTransport>,
 }
 
 impl ModelEndpoint {
     fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
-        ModelEndpoint { config, transport }
+        ModelEndpoint {
+            id: format!("llm-{}-model", config.provider),
+            config,
+            transport,
+        }
     }
 }
 
@@ -1214,11 +1226,11 @@ impl Endpoint for ModelEndpoint {
     }
 
     fn name(&self) -> &str {
-        "llm-model"
+        &self.id
     }
 
     fn describe(&self) -> Description {
-        let description = Description::new(format!("llm-{}-model", self.config.provider))
+        let description = Description::new(&self.id)
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8");
@@ -2419,13 +2431,19 @@ async fn get(
 /// complement of `urn:llm:models`: models/config say what's CONFIGURED, this
 /// says what's INSTALLED. Uncacheable — a live fact (pulls change it).
 pub struct InstalledEndpoint {
+    /// `llm-<provider>-installed`: one id per bound backend (ledger #2637).
+    id: String,
     config: OpenAiConfig,
     transport: Arc<dyn HttpTransport>,
 }
 
 impl InstalledEndpoint {
     fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
-        InstalledEndpoint { config, transport }
+        InstalledEndpoint {
+            id: format!("llm-{}-installed", config.provider),
+            config,
+            transport,
+        }
     }
 }
 
@@ -2460,11 +2478,11 @@ impl Endpoint for InstalledEndpoint {
     }
 
     fn name(&self) -> &str {
-        "llm-installed"
+        &self.id
     }
 
     fn describe(&self) -> Description {
-        let description = Description::new(format!("llm-{}-installed", self.config.provider))
+        let description = Description::new(&self.id)
             .summary(
                 "The models the provider can actually serve right now (newline list; \
                  as=application/json for an array). Live fact — uncacheable. The \
@@ -2505,13 +2523,19 @@ impl Endpoint for InstalledEndpoint {
 /// Deliberately **uncacheable** — liveness is a live fact. A capability that
 /// cannot reach the host is an error, not `false` (denied ≠ down).
 pub struct UpEndpoint {
+    /// `llm-<provider>-up`: one id per bound backend (ledger #2637).
+    id: String,
     config: OpenAiConfig,
     transport: Arc<dyn HttpTransport>,
 }
 
 impl UpEndpoint {
     fn new(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Self {
-        UpEndpoint { config, transport }
+        UpEndpoint {
+            id: format!("llm-{}-up", config.provider),
+            config,
+            transport,
+        }
     }
 }
 
@@ -2540,11 +2564,11 @@ impl Endpoint for UpEndpoint {
     }
 
     fn name(&self) -> &str {
-        "llm-up"
+        &self.id
     }
 
     fn describe(&self) -> Description {
-        Description::new(format!("llm-{}-up", self.config.provider))
+        Description::new(&self.id)
             .summary(
                 "Boolean liveness: `true` if the provider answers a cheap GET, else \
                  `false`. Branch on it with urn:fn:conditional to degrade gracefully.",
@@ -2678,7 +2702,7 @@ fn net_denied(who: &str, host: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ikigai_core::{ArgRef, Capability, Kernel, Space};
+    use ikigai_core::{ArgRef, Capability, Kernel, Resolution, Scope, Space};
     use std::sync::Mutex;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -2752,12 +2776,48 @@ mod tests {
                 !id.starts_with("urn:"),
                 "a description id is a label, not an IRI: {id}"
             );
-            let _ = name; // name()s are per-KIND; ids are per-BINDING (provider-qualified)
+            assert_eq!(id, name, "an endpoint describes itself by its own name");
         }
         assert_eq!(facade.describe().id, "llm-ask");
         assert_eq!(backend.describe().id, "llm-ollama-ask");
         assert_eq!(installed.describe().id, "llm-ollama-installed");
         assert_eq!(model.describe().id, "llm-ollama-model");
+        assert_eq!(up.describe().id, "llm-ollama-up");
+    }
+
+    /// One endpoint type is bound once per configured backend, and a door binds
+    /// by name: each instance must carry its backend's name, so no id names two
+    /// endpoints (ledger #2637). Two backends in one space: eight distinct
+    /// names, each matching its description, and none of the old shared ones.
+    #[test]
+    fn two_backends_in_one_space_have_distinct_endpoint_ids() {
+        let mock = MockTransport::new(CANNED);
+        let registry = Registry {
+            providers: vec![
+                OpenAiConfig::ollama("llama3.1"),
+                OpenAiConfig::discovering("big", "http://localhost:8000/v1"),
+            ],
+            default: "ollama".to_string(),
+        };
+        let space = space(mock as _, registry);
+        let mut names = std::collections::BTreeSet::new();
+        for provider in ["ollama", "big"] {
+            for kind in ["ask", "up", "installed", "model"] {
+                let iri = format!("urn:llm:{provider}:{kind}");
+                let request = Request::new(Verb::Meta, Iri::parse(&iri).unwrap());
+                let Resolution::Hit(hit) = space.resolve(&request, &Scope::empty()) else {
+                    panic!("{iri} is bound")
+                };
+                let name = hit.endpoint.name().to_string();
+                assert_eq!(name, format!("llm-{provider}-{kind}"), "{iri}");
+                assert_eq!(hit.endpoint.describe().id, name, "{iri}");
+                assert!(names.insert(name), "{iri}: an id names two endpoints");
+            }
+        }
+        assert_eq!(names.len(), 8);
+        for old in ["llm-openai", "llm-up", "llm-installed", "llm-model"] {
+            assert!(!names.contains(old), "the shared id `{old}` is gone");
+        }
     }
 
     #[test]
