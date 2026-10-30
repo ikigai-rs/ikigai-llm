@@ -72,6 +72,28 @@ HTTP bound. The `as=application/json` envelope also stays buffered, preserving
 its model, finish reason and usage fields. A server that ignores `stream: true`
 and answers a JSON document is still supported under the existing HTTP bound.
 
+### Endpoint ids
+Every endpoint reports its own id (`Endpoint::name()`, the same string as its
+description's `id`), so no id names two endpoints and a declared
+`(door … <id>)` names exactly one. The per-provider ids carry the provider's
+name from the registry, the `<provider>` of its IRIs:
+
+| IRI | id |
+| --- | --- |
+| `urn:llm:ask` | `llm-ask` |
+| `urn:llm:config` | `llm-config` |
+| `urn:llm:models` | `llm-models` |
+| `urn:llm:select` | `llm-select` |
+| `urn:llm:<provider>:ask` | `llm-<provider>-ask` |
+| `urn:llm:<provider>:up` | `llm-<provider>-up` |
+| `urn:llm:<provider>:installed` | `llm-<provider>-installed` |
+| `urn:llm:<provider>:model` | `llm-<provider>-model` |
+
+So a host with a provider `big` binds `llm-big-ask`, `llm-big-up`,
+`llm-big-installed` and `llm-big-model`, whether it configures one provider or
+seven. Before 0.19.0 those four reported the shared ids `llm-openai`, `llm-up`,
+`llm-installed` and `llm-model` from every provider.
+
 ### Mounting it
 The host injects an [`ikigai_http::HttpTransport`] (the same seam `ikigai-http`
 uses — `ureq`/`reqwest` natively, `fetch` in the browser):
@@ -393,6 +415,20 @@ its words (`timed out`, `timeout`) with the URL removed; anything else
 unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
+
+## 0.19.0 (unreleased)
+
+Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
+
+- **Each per-provider endpoint carries its provider's name in its id.**
+  `urn:llm:<provider>:ask`, `:up`, `:installed` and `:model` now report
+  `llm-<provider>-ask`, `-up`, `-installed` and `-model` from `name()`, as
+  their descriptions already did. They reported `llm-openai`, `llm-up`,
+  `llm-installed` and `llm-model` from every provider, so a host with seven
+  providers had four ids naming seven endpoints each, and an arrangement
+  binding a door by one could not be declared. See [Endpoint ids](#endpoint-ids).
+- Tests: each endpoint's `name()` equals its description's id, and two
+  providers in one space bind eight distinct ids.
 
 ## 0.17.1 (unreleased)
 
