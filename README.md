@@ -136,21 +136,35 @@ load-time form of "the logical config aliases to file-or-code"):
 
 ### Keys live in ikigai-secret, named by `api_key_secret`
 A provider that needs a key **names** it: `api_key_secret` is the name of an
-[`ikigai-secret`](https://crates.io/crates/ikigai-secret) secret, read at
-request time by issuing `urn:secret:<name>` through the kernel. The read runs
-under the caller's capability narrowed to `urn:cap:secret:read:<name>`, so the
-caller needs that grant beside `urn:cap:net:<host>`, and this module reaches
-that one secret and nothing else the caller can read. The host mounts the
-secrets space (`ikigai_secret::space`) beside this one. The key is never held
-in the registry, never cached, and never reported: `urn:llm:config` shows the
-secret's name, which is not a secret. Surrounding whitespace is trimmed, so a
-secret stored with `echo` works.
+[`ikigai-secret`](https://crates.io/crates/ikigai-secret) secret. The **host**
+reads it, at request time, through a `SecretReader` it hands this crate
+(`space_with_secrets(transport, secrets, registry)`), typically over the same
+`ikigai_secret::Backend` that backs `urn:secret:*`: the read runs on the host's
+authority, never the caller's.
+
+**A caller of a keyed provider holds `urn:cap:net:<host>` and
+`urn:cap:llm:use:<provider>`, and no `urn:cap:secret:*` grant.** Every action
+that sends the key (`urn:llm:<provider>:ask`, `:up`, `:installed`, and a
+discovering provider's `:model`) declares the use scope beside the net floor,
+so the manifold shows what is enforced, and the key is read only for a caller
+holding it. Do not grant model callers `urn:cap:secret:read:<name>`: that
+grant returns the raw key from `urn:secret:<name>`, so permission to use the
+key would be permission to take it (ledger #2706). The inventory and
+selection faces (`urn:llm:models`, `urn:llm:select`, the facade's `needs=`)
+probe a keyed provider only for a caller holding its use scope; for anyone
+else nothing is read and nothing is sent.
+
+The key is never held in the registry, never cached, and never reported:
+`urn:llm:config` shows the secret's name, which is not a secret. Surrounding
+whitespace is trimmed, so a secret stored with `echo` works.
 
 A secret that cannot be read refuses the request before anything is sent,
 naming the provider and the secret, never a value: an absent secret is
 `not found` (`urn:llm:remote: api_key_secret `remote-api-key` could not be read
-(not found: no secret `remote-api-key`)`), a caller without the grant is
-`denied`. A provider may not give both `api_key` and `api_key_secret`, and a
+(not found: no secret `remote-api-key`)`, when the host's reader answers
+`not found` for it), a caller without the use scope is `denied`, and a keyed
+provider mounted with plain `space` (no reader) refuses rather than reading
+under anyone else's authority. A provider may not give both `api_key` and `api_key_secret`, and a
 name that cannot name a secret (empty, beginning with `-`, or holding
 whitespace, `/`, `?` or `#`) is refused when the file loads.
 
@@ -463,22 +477,32 @@ Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
 unreleased minor.
 
 - **A provider's key can live in ikigai-secret.** `api_key_secret` (in
-  `llm.json`, and `OpenAiConfig::api_key_secret`) names a secret read through
-  `urn:secret:<name>` at request time, under the caller's capability narrowed
-  to `urn:cap:secret:read:<name>`, for the ask and for every probe (listing,
-  liveness, discovery). See [Keys live in
+  `llm.json`, and `OpenAiConfig::api_key_secret`) names a secret the host reads
+  at request time through the `SecretReader` it passes to
+  `space_with_secrets` (or sets as `OpenAiConfig::secrets`), for the ask and
+  for every probe (listing, liveness, discovery). See [Keys live in
   ikigai-secret](#keys-live-in-ikigai-secret-named-by-api_key_secret).
+- **A caller USES a keyed provider; it never reads the key** (ledger #2706).
+  A caller needs `urn:cap:llm:use:<provider>` (`ikigai_llm::use_scope`),
+  declared on every action that sends the key, and no `urn:cap:secret:read`
+  grant. An earlier draft of this release read the key under the caller's
+  capability narrowed to `urn:cap:secret:read:<name>`, so every model caller
+  had to hold the grant that returns the raw key from `urn:secret:<name>`, and
+  the actions declared only `urn:cap:net:*`; that draft was never published.
 - **An inline `api_key` is deprecated**, still working: loading one logs a
   line naming the provider, never the key.
 - **Refused at load:** a provider giving both `api_key` and `api_key_secret`,
   and an `api_key_secret` that cannot name a secret.
 - `urn:llm:config` reports each provider's `api_key_secret` (the name).
-- No new runtime dependency: the secret is read through the kernel.
+- No new runtime dependency: the host's reader is a one-method trait.
   `ikigai-secret` 0.3 is a dev-dependency for `tests/secret_key.rs`, which runs
-  the real secrets space over a scratch file store: a named secret
-  authenticates the ask and every probe, an absent secret refuses naming it
-  and sends nothing, a caller without the grant (or with another secret's) is
-  denied, and no error or face carries the key.
+  the real secrets space over a scratch file store beside a host reader over
+  the same store: a named secret authenticates the ask and every probe, an
+  absent secret refuses naming it and sends nothing, a caller without the use
+  scope (or with another provider's, or with only the secret's read grant) is
+  denied, every keyed action declares the use scope and no secret grant, and a
+  caller holding exactly the documented grants succeeds and is refused the key
+  at `urn:secret:<name>`.
 
 ## 0.17.1 (unreleased)
 

@@ -1,10 +1,14 @@
 //! A provider's key kept in ikigai-secret, not inline in the registry (ledger
-//! #2691). `api_key_secret` names a secret; the backend reads it through
-//! `urn:secret:<name>` at request time, under the caller's capability narrowed to
-//! that one secret's read scope.
+//! #2691). `api_key_secret` names a secret; the backend reads it at request time
+//! through the host's `SecretReader`, for a caller holding the provider's use
+//! scope `urn:cap:llm:use:<provider>` — never under the caller's own authority,
+//! so the grant that lets a caller use the key never lets it read the key
+//! (ledger #2706).
 //!
 //! The secrets space is the real one (`ikigai_secret::space`) over its file store
-//! in a scratch directory; the provider is [`Stub`], an in-process
+//! in a scratch directory, mounted beside llm so a test can try to read the key
+//! the way a caller would; the host's reader is [`HostSecrets`] over the same
+//! store; the provider is [`Stub`], an in-process
 //! [`HttpTransport`] that answers like an OpenAI-shaped API (401 without the right
 //! Bearer token) and logs every request, so a test can prove what was sent.
 
@@ -17,7 +21,7 @@ use ikigai_core::{
     Space, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
-use ikigai_llm::{space, OpenAiConfig, Registry};
+use ikigai_llm::{space, space_with_secrets, use_scope, OpenAiConfig, Registry, SecretReader};
 use ikigai_secret::{Backend, FileBackend};
 
 /// The secret's value: a shape every provider-issued key has.
@@ -77,6 +81,19 @@ impl HttpTransport for Stub {
     }
 }
 
+/// The host's reader: its own keystore, read on its own authority, as a host
+/// bridges `ikigai_secret::Backend` (ikigai-embedded's `HostSecrets` for
+/// ikigai-meeting is the same few lines).
+struct HostSecrets(Arc<FileBackend>);
+
+impl SecretReader for HostSecrets {
+    fn read(&self, name: &str) -> ikigai_core::Result<Vec<u8>> {
+        self.0
+            .get(name)?
+            .ok_or_else(|| Error::NotFound(format!("no secret `{name}`")))
+    }
+}
+
 /// A scratch secrets store, removed when dropped.
 struct Store(PathBuf);
 
@@ -107,10 +124,15 @@ const NAMED_DISCOVERING: &str = r#"{ "default": "remote", "providers": {
     "remote": { "base_url": "https://api.example.com/v1",
                 "api_key_secret": "remote-api-key" } } }"#;
 
-/// The llm space with the real secrets space behind it, in one kernel.
+/// The llm space, reading keys through the host's reader, with the real secrets
+/// space beside it, in one kernel.
 fn kernel(stub: Arc<Stub>, store: &Store, json: &str) -> Kernel {
     let transport: Arc<dyn HttpTransport> = stub;
-    let llm: EndpointSpace = space(transport, Registry::from_json(json).unwrap());
+    let llm: EndpointSpace = space_with_secrets(
+        transport,
+        Arc::new(HostSecrets(store.backend())),
+        Registry::from_json(json).unwrap(),
+    );
     let secrets = ikigai_secret::space(store.backend());
     let spaces: Vec<Arc<dyn Space>> = vec![Arc::new(llm), Arc::new(secrets)];
     Kernel::new(Arc::new(Fallback::new(spaces)))
@@ -137,12 +159,10 @@ fn scoped(scopes: &[&str]) -> Capability {
     Capability::scoped(scopes.iter().map(|s| s.to_string()))
 }
 
-/// What a caller of a secret-keyed provider holds: the host, and the one secret.
+/// What a caller of a secret-keyed provider holds: the host, and the use of the
+/// provider. No `urn:cap:secret:*` grant at all.
 fn granted() -> Capability {
-    scoped(&[
-        "urn:cap:net:api.example.com",
-        "urn:cap:secret:read:remote-api-key",
-    ])
+    scoped(&["urn:cap:net:api.example.com", "urn:cap:llm:use:remote"])
 }
 
 #[test]
@@ -222,11 +242,11 @@ fn a_missing_secret_refuses_naming_the_secret_and_sends_nothing() {
     assert!(stub.sent().is_empty(), "nothing went out without the key");
 }
 
-/// A caller who may reach the host but not read the secret is refused — the
-/// module does not read the secret on its own authority — naming the secret, and
-/// the error carries no part of the stored value.
+/// A caller who may reach the host but not use the provider is refused before
+/// the key is read, and the error carries no part of the stored value. Holding
+/// the secret's read grant instead does not stand in for the use scope.
 #[test]
-fn a_caller_without_the_secret_grant_is_denied_and_never_sees_the_key() {
+fn a_caller_without_the_use_scope_is_denied_and_never_sees_the_key() {
     let store = Store::new("denied");
     store.backend().set(SECRET, KEY.as_bytes()).unwrap();
     let stub = Stub::new();
@@ -240,22 +260,112 @@ fn a_caller_without_the_secret_grant_is_denied_and_never_sees_the_key() {
     .unwrap_err();
     assert!(matches!(err, Error::Denied(_)), "{err:?}");
     let message = err.to_string();
-    assert!(message.contains(SECRET), "names the secret: {message}");
+    assert!(
+        message.contains("urn:cap:llm:use:remote"),
+        "names the scope: {message}"
+    );
     assert!(!message.contains(KEY), "the key leaked: {message}");
     assert!(stub.sent().is_empty());
 
-    // A grant for a DIFFERENT secret does not reach this one: the read is
-    // narrowed to the named secret's own scope.
-    let err = run(
-        &k,
-        ask("urn:llm:remote:ask"),
-        &scoped(&[
-            "urn:cap:net:api.example.com",
-            "urn:cap:secret:read:other-key",
-        ]),
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::Denied(_)), "{err:?}");
+    // Neither the use of a DIFFERENT provider nor the old read grant on the
+    // secret stands in for this provider's use scope; the facade routes to the
+    // same backend and is refused the same way.
+    for (iri, held) in [
+        ("urn:llm:remote:ask", "urn:cap:llm:use:other"),
+        ("urn:llm:remote:ask", "urn:cap:secret:read:remote-api-key"),
+        ("urn:llm:ask", "urn:cap:secret:read:remote-api-key"),
+    ] {
+        let err = run(
+            &k,
+            ask(iri),
+            &scoped(&["urn:cap:net:api.example.com", held]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{iri} {held}: {err:?}");
+        assert!(!err.to_string().contains(KEY), "the key leaked: {err}");
+    }
+    assert!(stub.sent().is_empty());
+}
+
+/// Declared = enforced: every action that sends a keyed provider's key declares
+/// its use scope beside the net floor, and none declares a secret grant. An
+/// unkeyed provider declares no use scope.
+#[test]
+fn a_keyed_providers_actions_declare_its_use_scope_and_no_secret_grant() {
+    let store = Store::new("declared");
+    let json = r#"{ "default": "remote", "providers": {
+        "remote": { "base_url": "https://api.example.com/v1",
+                    "api_key_secret": "remote-api-key" },
+        "local":  { "base_url": "http://localhost:11434/v1" } } }"#;
+    let k = kernel(Stub::new(), &store, json);
+    assert_eq!(use_scope("remote"), "urn:cap:llm:use:remote");
+    let requires = |iri: String| -> Vec<String> {
+        k.describe(&Iri::parse(&iri).unwrap())
+            .unwrap()
+            .action_specs()
+            .into_iter()
+            .flat_map(|s| s.requires)
+            .collect()
+    };
+    for face in ["ask", "up", "installed", "model"] {
+        let keyed = requires(format!("urn:llm:remote:{face}"));
+        assert_eq!(
+            keyed,
+            ["urn:cap:net:*", "urn:cap:llm:use:remote"],
+            "{face}: declared = enforced"
+        );
+        let unkeyed = requires(format!("urn:llm:local:{face}"));
+        assert_eq!(unkeyed, ["urn:cap:net:*"], "local {face}");
+    }
+}
+
+/// The inventory probes every provider without declaring each one's scope: a
+/// caller without the use scope is not refused the inventory, the keyed
+/// provider is simply not probed (nothing is sent, no key is read).
+#[test]
+fn the_inventory_does_not_probe_a_keyed_provider_the_caller_cannot_use() {
+    let store = Store::new("inventory");
+    store.backend().set(SECRET, KEY.as_bytes()).unwrap();
+    let stub = Stub::new();
+    let k = kernel(Arc::clone(&stub), &store, NAMED_DISCOVERING);
+    let body = text(
+        &run(
+            &k,
+            get("urn:llm:models"),
+            &scoped(&["urn:cap:net:api.example.com"]),
+        )
+        .unwrap(),
+    );
+    assert!(body.contains("remote"), "{body}");
+    assert!(!body.contains(KEY));
+    assert!(stub.sent().is_empty(), "probed without the use scope");
+}
+
+/// A keyed provider mounted with `space` (no reader) refuses, naming the
+/// provider and the secret: it never falls back to the caller's authority.
+#[test]
+fn a_keyed_provider_without_a_reader_refuses_and_sends_nothing() {
+    let store = Store::new("noreader");
+    store.backend().set(SECRET, KEY.as_bytes()).unwrap();
+    let stub = Stub::new();
+    let transport: Arc<dyn HttpTransport> = stub.clone();
+    let spaces: Vec<Arc<dyn Space>> = vec![
+        Arc::new(space(transport, Registry::from_json(NAMED).unwrap())),
+        Arc::new(ikigai_secret::space(store.backend())),
+    ];
+    let k = Kernel::new(Arc::new(Fallback::new(spaces)));
+    let caller = scoped(&[
+        "urn:cap:net:api.example.com",
+        "urn:cap:llm:use:remote",
+        "urn:cap:secret:read:remote-api-key",
+    ]);
+    let err = run(&k, ask("urn:llm:remote:ask"), &caller).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("SecretReader"), "{message}");
+    assert!(
+        message.contains(SECRET) && message.contains("remote"),
+        "{message}"
+    );
     assert!(stub.sent().is_empty());
 }
 
@@ -341,6 +451,7 @@ fn a_provider_built_in_code_may_name_a_secret() {
     let config = OpenAiConfig {
         base_url: "https://api.example.com/v1".to_string(),
         api_key_secret: Some(SECRET.to_string()),
+        secrets: Some(Arc::new(HostSecrets(store.backend()))),
         ..OpenAiConfig::discovering("remote", "unused")
     };
     let stub = Stub::new();
@@ -356,8 +467,10 @@ fn a_provider_built_in_code_may_name_a_secret() {
 }
 
 /// Ledger #2706: the grants a model caller needs must not hand it the key. A
-/// caller holding exactly what this crate tells it to hold asks the provider,
-/// then asks ikigai-secret for the same secret directly.
+/// caller holding exactly what this crate tells it to hold (and no
+/// `urn:cap:secret:read`) asks the provider, then asks ikigai-secret for the
+/// same secret directly, and is refused. Before the fix the README told it to
+/// hold `urn:cap:secret:read:<name>`, and this read returned the key.
 #[test]
 fn the_grants_a_model_caller_needs_cannot_read_the_key() {
     let store = Store::new("repro");
