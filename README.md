@@ -444,10 +444,23 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
-## 0.20.0 (unreleased)
+## 0.19.0 (unreleased)
 
-Minor, **BREAKING for code that builds an `OpenAiConfig` with a struct
-literal** (ledger #2691): the public struct gains a field.
+Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
+
+- **Each per-provider endpoint carries its provider's name in its id.**
+  `urn:llm:<provider>:ask`, `:up`, `:installed` and `:model` now report
+  `llm-<provider>-ask`, `-up`, `-installed` and `-model` from `name()`, as
+  their descriptions already did. They reported `llm-openai`, `llm-up`,
+  `llm-installed` and `llm-model` from every provider, so a host with seven
+  providers had four ids naming seven endpoints each, and an arrangement
+  binding a door by one could not be declared. See [Endpoint ids](#endpoint-ids).
+- Tests: each endpoint's `name()` equals its description's id, and two
+  providers in one space bind eight distinct ids.
+
+**Also in 0.19.0: provider keys in ikigai-secret** (ledger #2691), **BREAKING for code that builds an
+`OpenAiConfig` with a struct literal**: the public struct gains a field. Both changes ship in this one
+unreleased minor.
 
 - **A provider's key can live in ikigai-secret.** `api_key_secret` (in
   `llm.json`, and `OpenAiConfig::api_key_secret`) names a secret read through
@@ -466,20 +479,6 @@ literal** (ledger #2691): the public struct gains a field.
   authenticates the ask and every probe, an absent secret refuses naming it
   and sends nothing, a caller without the grant (or with another secret's) is
   denied, and no error or face carries the key.
-
-## 0.19.0 (unreleased)
-
-Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
-
-- **Each per-provider endpoint carries its provider's name in its id.**
-  `urn:llm:<provider>:ask`, `:up`, `:installed` and `:model` now report
-  `llm-<provider>-ask`, `-up`, `-installed` and `-model` from `name()`, as
-  their descriptions already did. They reported `llm-openai`, `llm-up`,
-  `llm-installed` and `llm-model` from every provider, so a host with seven
-  providers had four ids naming seven endpoints each, and an arrangement
-  binding a door by one could not be declared. See [Endpoint ids](#endpoint-ids).
-- Tests: each endpoint's `name()` equals its description's id, and two
-  providers in one space bind eight distinct ids.
 
 ## 0.17.1 (unreleased)
 
