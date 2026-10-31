@@ -718,3 +718,7 @@ live resource that sources the file under a golden thread), **transrepted config
 (author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,
 deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX (pyo3),
 heartbeat/idle limits for live feeds, and `urn:llm:embed`.
+
+## Accessibility
+
+What this crate writes that people read, what of it is a model's text rather than this crate's, the rules its own text follows, how it is tested and its known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a barrier with an issue carrying the `accessibility` label.
