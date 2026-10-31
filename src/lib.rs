@@ -48,6 +48,39 @@ mod streaming;
 /// grant — the declared floor, the per-host ceiling.
 const CAP_NET: &str = "urn:cap:net:*";
 
+/// The scope that lets a caller USE `provider` when its key lives in
+/// ikigai-secret: `urn:cap:llm:use:<provider>`. A provider naming an
+/// `api_key_secret` declares it on every action that sends the key (beside
+/// `urn:cap:net:*`), and the key is read only for a caller holding it, through the
+/// host's [`SecretReader`] — never under the caller's own authority, so the grant
+/// that lets a caller use the key is not a grant that returns it (ledger #2706).
+pub fn use_scope(provider: &str) -> String {
+    format!("urn:cap:llm:use:{provider}")
+}
+
+/// A read-only secret resolver the HOST hands this module for the provider keys
+/// it configured (the same injection discipline the [`HttpTransport`] gets, and
+/// the shape `ikigai-meeting` takes). The host reads its own secret store on its
+/// own authority, typically over the `ikigai_secret::Backend` that also backs
+/// `urn:secret:*`; this module asks it only for a provider's `api_key_secret`, and
+/// only once the caller holds that provider's [`use_scope`]. So no caller needs
+/// `urn:cap:secret:read:<name>`, the grant that would hand it the raw key.
+///
+/// Sync because a keystore `get` is a fast blocking call (as ikigai-secret's
+/// own `Backend` is). An absent secret should answer [`Error::NotFound`]; any
+/// error the host returns keeps its class and is named by provider and secret,
+/// so it must not carry the value.
+pub trait SecretReader: Send + Sync {
+    /// The bytes of the secret named `name`.
+    fn read(&self, name: &str) -> Result<Vec<u8>>;
+}
+
+impl std::fmt::Debug for dyn SecretReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretReader")
+    }
+}
+
 /// The golden thread every **config-derived** cacheable representation depends
 /// on — `urn:llm:config` itself, a pinned provider's `urn:llm:<provider>:model`,
 /// and `urn:llm:models` and `urn:llm:select` when answering them asked no
@@ -177,13 +210,20 @@ pub struct OpenAiConfig {
     /// [`api_key_secret`]: OpenAiConfig::api_key_secret
     pub api_key: Option<String>,
     /// The **name** of an `ikigai-secret` secret holding the Bearer token, e.g.
-    /// `"openai-api-key"`. Resolved at request time by issuing
-    /// `urn:secret:<name>` through the kernel under the caller's capability,
-    /// narrowed to `urn:cap:secret:read:<name>`, so a caller without that grant
-    /// is refused and the key is never held in the registry, cached, or reported.
-    /// A secret that cannot be read refuses the request naming the secret, never
-    /// its value. Exclusive with [`api_key`](OpenAiConfig::api_key).
+    /// `"openai-api-key"`. Resolved at request time through the host's
+    /// [`SecretReader`] ([`secrets`](OpenAiConfig::secrets)), and only for a
+    /// caller holding this provider's [`use_scope`], which every action that sends
+    /// the key declares: a caller without it is refused, and no caller needs a
+    /// grant that would read the key itself. The key is never held in the
+    /// registry, cached, or reported. A secret that cannot be read refuses the
+    /// request naming the secret, never its value. Exclusive with
+    /// [`api_key`](OpenAiConfig::api_key).
     pub api_key_secret: Option<String>,
+    /// The host's reader for [`api_key_secret`](OpenAiConfig::api_key_secret).
+    /// [`space_with_secrets`] sets it on every provider; a keyed provider without
+    /// one refuses every request that would send its key. `None` from
+    /// [`Registry::from_json`] and the constructors.
+    pub secrets: Option<Arc<dyn SecretReader>>,
     /// The declared capability profile (what `urn:llm:models` reports and
     /// selection will reason over). Empty by default.
     pub caps: Caps,
@@ -198,6 +238,7 @@ impl OpenAiConfig {
             default_model: Some(default_model.into()),
             api_key: None,
             api_key_secret: None,
+            secrets: None,
             caps: Caps {
                 cost: Some("local".to_string()),
                 vendor: Some("ollama".to_string()),
@@ -217,6 +258,7 @@ impl OpenAiConfig {
             default_model: None,
             api_key: None,
             api_key_secret: None,
+            secrets: None,
             caps: Caps::default(),
         }
     }
@@ -256,7 +298,8 @@ impl Registry {
     /// ```
     ///
     /// **A key is named, not written.** `api_key_secret` names an `ikigai-secret`
-    /// secret, read through `urn:secret:<name>` at request time. An inline
+    /// secret, read at request time through the host's [`SecretReader`] (see
+    /// [`space_with_secrets`]) for a caller holding the provider's [`use_scope`]. An inline
     /// `api_key` still loads, but is deprecated: it logs one line per provider
     /// on stderr naming the provider (never the key).
     ///
@@ -304,6 +347,7 @@ impl Registry {
                 default_model: e.model,
                 api_key: e.api_key,
                 api_key_secret: e.api_key_secret,
+                secrets: None,
                 caps: e.caps,
             })
             .collect();
@@ -540,7 +584,9 @@ impl From<OpenAiConfig> for Registry {
 /// addressable and catalog-advertised with its own model/base_url), and
 /// `urn:llm:config` (the effective registry, keys redacted).
 /// Accepts a [`Registry`] or — via `From<OpenAiConfig>` — a single [`OpenAiConfig`].
-/// The host supplies the [`HttpTransport`].
+/// The host supplies the [`HttpTransport`]. A provider naming an `api_key_secret`
+/// needs a [`SecretReader`] too: mount with [`space_with_secrets`], or set
+/// [`OpenAiConfig::secrets`] on the provider.
 pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -> EndpointSpace {
     let registry = registry.into();
     let mut space = EndpointSpace::new()
@@ -580,6 +626,26 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
             );
     }
     space
+}
+
+/// [`space`], with the host's [`SecretReader`] for the provider keys the registry
+/// names by `api_key_secret`. The reader replaces any a provider already carried.
+///
+/// A keyed provider's actions then require `urn:cap:net:<host>` and its
+/// [`use_scope`] (`urn:cap:llm:use:<provider>`), and the key is read through
+/// `secrets`, on the host's authority: the caller holds no
+/// `urn:cap:secret:read:<name>`, so the grant that lets it ask the model never
+/// lets it read the key from `urn:secret:<name>` (ledger #2706).
+pub fn space_with_secrets(
+    transport: Arc<dyn HttpTransport>,
+    secrets: Arc<dyn SecretReader>,
+    registry: impl Into<Registry>,
+) -> EndpointSpace {
+    let mut registry = registry.into();
+    for provider in &mut registry.providers {
+        provider.secrets = Some(Arc::clone(&secrets));
+    }
+    space(transport, registry)
 }
 
 // ---- the facade -------------------------------------------------------------
@@ -712,10 +778,25 @@ impl Endpoint for OpenAiBackend {
     }
 
     fn describe(&self) -> Description {
-        ask_description(
-            &self.id,
-            "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
+        requires_use(
+            ask_description(
+                &self.id,
+                "Chat completion via an OpenAI-compatible backend (Ollama/vLLM/llama.cpp/mlx_lm/LM Studio).",
+            ),
+            &self.config,
         )
+    }
+}
+
+/// `description`, plus the provider's [`use_scope`] when its key lives in
+/// ikigai-secret: declared = enforced, on every action that sends the key (ask,
+/// up, installed, and a discovering provider's model). A provider with no key or
+/// an inline one declares nothing more.
+fn requires_use(description: Description, config: &OpenAiConfig) -> Description {
+    if config.api_key_secret.is_some() {
+        description.requires(use_scope(&config.provider))
+    } else {
+        description
     }
 }
 
@@ -1302,7 +1383,7 @@ impl Endpoint for ModelEndpoint {
                  the whole urn:llm:config registry. No network; cacheable.",
             )
         } else {
-            fails_like_an_origin(
+            fails_like_an_origin(requires_use(
                 description
                     .summary(
                         "The model this provider's SERVER is serving right now (text/plain) \
@@ -1310,7 +1391,8 @@ impl Endpoint for ModelEndpoint {
                          honest identity. Probes the backend; uncacheable.",
                     )
                     .requires(CAP_NET),
-            )
+                &self.config,
+            ))
         }
     }
 }
@@ -2567,7 +2649,7 @@ impl Endpoint for InstalledEndpoint {
             .output("text/plain;charset=utf-8")
             .output("application/json;charset=utf-8")
             .requires(CAP_NET);
-        fails_like_an_origin(description)
+        fails_like_an_origin(requires_use(description, &self.config))
     }
 }
 
@@ -2625,7 +2707,7 @@ impl Endpoint for UpEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new(&self.id)
+        let description = Description::new(&self.id)
             .summary(
                 "Boolean liveness: `true` if the provider answers a cheap GET, else \
                  `false`. Branch on it with urn:fn:conditional to degrade gracefully.",
@@ -2636,7 +2718,8 @@ impl Endpoint for UpEndpoint {
             .requires(CAP_NET)
             // A server that does not answer is `false`, not an error; only a
             // `base_url` that does not parse fails, untyped (`Endpoint`).
-            .fails(FailureClass::Unknown)
+            .fails(FailureClass::Unknown);
+        requires_use(description, &self.config)
     }
 }
 
@@ -2685,8 +2768,8 @@ fn may_reach(inv: &Invocation<'_>, url: &url::Url) -> bool {
 /// at a transport that does not police header bytes.
 ///
 /// A provider naming an `api_key_secret` has its key read here, per request,
-/// through `urn:secret:<name>` ([`secret_key`]); the key lives only in the
-/// returned header.
+/// through the host's [`SecretReader`] ([`secret_key`]); the key lives only in
+/// the returned header.
 async fn provider_headers(
     inv: &Invocation<'_>,
     config: &OpenAiConfig,
@@ -2734,32 +2817,42 @@ fn secret_iri(provider: &str, name: &str) -> Result<Iri> {
     Iri::parse(format!("urn:secret:{name}")).map_err(|e| refuse(&e.to_string()))
 }
 
-/// The key `config` names by `api_key_secret`, read through the kernel at
-/// request time: a Source on `urn:secret:<name>` under the caller's capability
-/// narrowed to `urn:cap:secret:read:<name>`, so this module reaches that one
-/// secret and nothing else the caller may read. Surrounding whitespace is
+/// The key `config` names by `api_key_secret`, read at request time through the
+/// host's [`SecretReader`], and only for a caller holding the provider's
+/// [`use_scope`]. The check is here as well as in each action's declared
+/// `requires` because the inventory and selection faces (`urn:llm:models`,
+/// `urn:llm:select`, the facade's `needs=`) probe every provider without
+/// declaring each one's scope: for a caller without it, the probe is refused
+/// before the key is read and before anything is sent. Surrounding whitespace is
 /// trimmed (a secret written with `echo` ends in a newline; no Bearer token
 /// holds whitespace).
 ///
-/// A failure keeps its class (`denied` for a caller without the grant, `not
+/// A failure keeps its class (`denied` for a caller without the scope, `not
 /// found` for an absent secret) and names the provider and the SECRET — never
 /// a value: on failure there is none, and on success the key goes only into the
 /// `Authorization` header, where [`bearer`] refuses one that is not a token
 /// without quoting it.
 async fn secret_key(inv: &Invocation<'_>, config: &OpenAiConfig, name: &str) -> Result<String> {
-    let target = secret_iri(&config.provider, name)?;
-    let scope = format!("urn:cap:secret:read:{name}");
+    secret_iri(&config.provider, name)?;
     let context = |m: &str| {
         format!(
             "urn:llm:{}: api_key_secret `{name}` could not be read ({m})",
             config.provider
         )
     };
-    let repr = inv
-        .issue_attenuated(Request::new(Verb::Source, target), [scope])
-        .await
-        .map_err(|e| with_context(e, context))?;
-    let key = String::from_utf8(repr.bytes)
+    let scope = use_scope(&config.provider);
+    if !inv.capability.allows(&scope) {
+        return Err(Error::Denied(context(&format!(
+            "using this provider requires `{scope}`"
+        ))));
+    }
+    let Some(secrets) = &config.secrets else {
+        return Err(Error::Endpoint(context(
+            "the host gave no SecretReader: mount with `space_with_secrets`",
+        )));
+    };
+    let bytes = secrets.read(name).map_err(|e| with_context(e, context))?;
+    let key = String::from_utf8(bytes)
         .map_err(|_| Error::Endpoint(context("the secret is not UTF-8")))?;
     Ok(key.trim().to_string())
 }

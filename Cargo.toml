@@ -71,8 +71,9 @@ futures = "0.3"
 ikigai-conformance = "0.12.0"
 # The real secrets space (`urn:secret:{name}`) over its file store in a scratch
 # directory, for `tests/secret_key.rs`: a provider's `api_key_secret` is read
-# through it (ledger #2691). Dev-only: the library issues `urn:secret:<name>`
-# through the kernel and links no secrets crate. "0.3.0" admits 0.3.x only.
+# from it by the test host's `SecretReader` (ledger #2691, #2706), and the space
+# proves a model caller cannot read the key there. Dev-only: the library takes
+# the host's reader and links no secrets crate. "0.3.0" admits 0.3.x only.
 ikigai-secret = "0.3.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
