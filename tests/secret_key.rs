@@ -354,3 +354,22 @@ fn a_provider_built_in_code_may_name_a_secret() {
     let rep = run(&k, ask("urn:llm:remote:ask"), &granted()).unwrap();
     assert_eq!(text(&rep), "Hello there!");
 }
+
+/// Ledger #2706: the grants a model caller needs must not hand it the key. A
+/// caller holding exactly what this crate tells it to hold asks the provider,
+/// then asks ikigai-secret for the same secret directly.
+#[test]
+fn the_grants_a_model_caller_needs_cannot_read_the_key() {
+    let store = Store::new("repro");
+    store.backend().set(SECRET, KEY.as_bytes()).unwrap();
+    let stub = Stub::new();
+    let k = kernel(Arc::clone(&stub), &store, NAMED);
+
+    let rep = run(&k, ask("urn:llm:remote:ask"), &granted()).unwrap();
+    assert_eq!(text(&rep), "Hello there!");
+
+    match run(&k, get("urn:secret:remote-api-key"), &granted()) {
+        Ok(rep) => panic!("the caller read the raw key: {:?}", text(&rep)),
+        Err(e) => assert!(matches!(e, Error::Denied(_)), "{e:?}"),
+    }
+}
