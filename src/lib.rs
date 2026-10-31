@@ -168,7 +168,22 @@ pub struct OpenAiConfig {
     /// any `=`), as every provider-issued key is: [`Registry::from_json`] refuses
     /// one that is not, and so does every request to a provider built in code
     /// with one, before anything is sent. Neither refusal quotes the key.
+    ///
+    /// **Deprecated in a registry file** in favor of [`api_key_secret`]: a key
+    /// written inline sits in plain text in the JSON. [`Registry::from_json`]
+    /// still loads one, and logs a deprecation line naming the provider (never
+    /// the key).
+    ///
+    /// [`api_key_secret`]: OpenAiConfig::api_key_secret
     pub api_key: Option<String>,
+    /// The **name** of an `ikigai-secret` secret holding the Bearer token, e.g.
+    /// `"openai-api-key"`. Resolved at request time by issuing
+    /// `urn:secret:<name>` through the kernel under the caller's capability,
+    /// narrowed to `urn:cap:secret:read:<name>`, so a caller without that grant
+    /// is refused and the key is never held in the registry, cached, or reported.
+    /// A secret that cannot be read refuses the request naming the secret, never
+    /// its value. Exclusive with [`api_key`](OpenAiConfig::api_key).
+    pub api_key_secret: Option<String>,
     /// The declared capability profile (what `urn:llm:models` reports and
     /// selection will reason over). Empty by default.
     pub caps: Caps,
@@ -182,6 +197,7 @@ impl OpenAiConfig {
             base_url: "http://localhost:11434/v1".to_string(),
             default_model: Some(default_model.into()),
             api_key: None,
+            api_key_secret: None,
             caps: Caps {
                 cost: Some("local".to_string()),
                 vendor: Some("ollama".to_string()),
@@ -200,6 +216,7 @@ impl OpenAiConfig {
             base_url: base_url.into(),
             default_model: None,
             api_key: None,
+            api_key_secret: None,
             caps: Caps::default(),
         }
     }
@@ -233,9 +250,15 @@ impl Registry {
     ///     "fast":   { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" },
     ///     "server": { "base_url": "http://localhost:8000/v1",
     ///                 "caps": { "cost": "local", "vendor": "mlx" } },
-    ///     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
+    ///     "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o",
+    ///                 "api_key_secret": "remote-api-key" }
     ///   } }
     /// ```
+    ///
+    /// **A key is named, not written.** `api_key_secret` names an `ikigai-secret`
+    /// secret, read through `urn:secret:<name>` at request time. An inline
+    /// `api_key` still loads, but is deprecated: it logs one line per provider
+    /// on stderr naming the provider (never the key).
     ///
     /// **`model` is optional.** An entry that omits it names the *server*: the
     /// model is discovered from the backend per resolve, so swapping the model
@@ -247,7 +270,9 @@ impl Registry {
     /// that misroutes in silence: an unknown key at any level (`batchat`,
     /// `modle`), a `cost` outside `local` | `cheap` | `premium`, `batchAt: 0`,
     /// an `api_key` that is not an RFC 6750 Bearer token (named by provider, the
-    /// key never quoted), and a `default` that names no configured provider.
+    /// key never quoted), a provider giving both `api_key` and `api_key_secret`,
+    /// an `api_key_secret` that cannot name a secret (empty, beginning with `-`,
+    /// or not an IRI segment), and a `default` that names no configured provider.
     pub fn from_json(json: &str) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -257,6 +282,8 @@ impl Registry {
             model: Option<String>,
             #[serde(default)]
             api_key: Option<String>,
+            #[serde(default)]
+            api_key_secret: Option<String>,
             #[serde(default)]
             caps: Caps,
         }
@@ -276,6 +303,7 @@ impl Registry {
                 base_url: e.base_url,
                 default_model: e.model,
                 api_key: e.api_key,
+                api_key_secret: e.api_key_secret,
                 caps: e.caps,
             })
             .collect();
@@ -316,6 +344,20 @@ impl Registry {
                 bearer(&p.provider, key)?;
             }
         }
+        // A key named twice has no answer to "which one is sent?". A secret name
+        // that cannot name a secret would load, then refuse every request.
+        for p in &providers {
+            if let Some(name) = &p.api_key_secret {
+                if p.api_key.is_some() {
+                    return Err(Error::Endpoint(format!(
+                        "urn:llm:config: provider `{}` gives both `api_key` and \
+                         `api_key_secret` — keep only `api_key_secret`",
+                        p.provider
+                    )));
+                }
+                secret_iri(&p.provider, name)?;
+            }
+        }
         // A default naming no provider would load, fail every unrouted ask, and
         // have the trait graph assert a route to a backend that does not exist.
         if !providers.iter().any(|p| p.provider == doc.default) {
@@ -326,6 +368,17 @@ impl Registry {
                 doc.default,
                 names.join(", ")
             )));
+        }
+        // Deprecated, still working: an inline key is plain text in this file.
+        // Logged after every refusal above, so a registry that does not load
+        // logs nothing. The line names the provider, never the key.
+        for p in providers.iter().filter(|p| p.api_key.is_some()) {
+            eprintln!(
+                "urn:llm:config: provider `{}` keeps its api_key inline in the registry, \
+                 which is deprecated: store the key in ikigai-secret and name it with \
+                 `api_key_secret`",
+                p.provider
+            );
         }
         Ok(Registry {
             default: doc.default,
@@ -726,7 +779,7 @@ impl OpenAiBackend {
             payload["max_tokens"] = json!(m);
         }
 
-        let headers = provider_headers(&self.config, true)?;
+        let headers = provider_headers(inv, &self.config, true).await?;
         let mut response = post_response(self.transport.as_ref(), &url, &headers, &payload).await?;
         let mut answered_by = model;
 
@@ -1122,6 +1175,9 @@ impl Endpoint for ConfigEndpoint {
                     // stays a pure config read — it never probes.
                     "model": p.default_model,
                     "api_key": p.api_key.as_ref().map(|_| "***"),
+                    // A secret's NAME is not the secret: reported verbatim, so
+                    // an operator can see which secret a provider reads.
+                    "api_key_secret": p.api_key_secret,
                 }),
             );
         }
@@ -1480,7 +1536,7 @@ async fn discovered_caps(
         .send(HttpRequest {
             method: Method::Post,
             url,
-            headers: provider_headers(provider, true).ok()?,
+            headers: provider_headers(inv, provider, true).await.ok()?,
             body,
         })
         .await
@@ -2279,7 +2335,7 @@ async fn installed_models(
         "models",
         &format!("urn:llm:{}:installed", config.provider),
     )?;
-    let response = receive(get(transport, config, url).await?).await?;
+    let response = receive(get(transport, inv, config, url).await?).await?;
     if response.status >= 400 {
         return Err(status_failure(
             inv,
@@ -2330,7 +2386,7 @@ async fn annotate_capabilities(
     if !may_reach(inv, &parsed) {
         return;
     }
-    let Ok(headers) = provider_headers(config, true) else {
+    let Ok(headers) = provider_headers(inv, config, true).await else {
         return;
     };
     for m in models.iter_mut() {
@@ -2377,7 +2433,7 @@ async fn installed_via_tags(
             parsed.host_str().unwrap_or(""),
         ));
     }
-    let response = receive(get(transport, config, url).await?).await?;
+    let response = receive(get(transport, inv, config, url).await?).await?;
     if response.status >= 400 {
         return Err(status_failure(
             inv,
@@ -2412,6 +2468,7 @@ async fn installed_via_tags(
 /// credentials scrubbed from it).
 async fn get(
     transport: &dyn HttpTransport,
+    inv: &Invocation<'_>,
     config: &OpenAiConfig,
     url: String,
 ) -> Result<HttpResponse> {
@@ -2419,7 +2476,7 @@ async fn get(
         .send(HttpRequest {
             method: Method::Get,
             url: url.clone(),
-            headers: provider_headers(config, false)?,
+            headers: provider_headers(inv, config, false).await?,
             body: Vec::new(),
         })
         .await
@@ -2549,7 +2606,7 @@ impl Endpoint for UpEndpoint {
             &format!("urn:llm:{}:up", self.config.provider),
         )?;
         // The status is the whole answer: the body is dropped unread.
-        let alive = match get(self.transport.as_ref(), &self.config, url).await {
+        let alive = match get(self.transport.as_ref(), inv, &self.config, url).await {
             Ok(response) => response.status < 400,
             Err(_) => false, // unreachable server = down, not an error
         };
@@ -2626,7 +2683,15 @@ fn may_reach(inv: &Invocation<'_>, url: &url::Url) -> bool {
 /// A key that is not an RFC 6750 `b64token` is refused here, before any request
 /// is built, so a configured key carrying a CR/LF can never become a second header
 /// at a transport that does not police header bytes.
-fn provider_headers(config: &OpenAiConfig, json_body: bool) -> Result<Vec<(String, String)>> {
+///
+/// A provider naming an `api_key_secret` has its key read here, per request,
+/// through `urn:secret:<name>` ([`secret_key`]); the key lives only in the
+/// returned header.
+async fn provider_headers(
+    inv: &Invocation<'_>,
+    config: &OpenAiConfig,
+    json_body: bool,
+) -> Result<Vec<(String, String)>> {
     let mut headers = Vec::new();
     if json_body {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
@@ -2634,7 +2699,69 @@ fn provider_headers(config: &OpenAiConfig, json_body: bool) -> Result<Vec<(Strin
     if let Some(key) = &config.api_key {
         headers.push(("Authorization".to_string(), bearer(&config.provider, key)?));
     }
+    if let Some(name) = &config.api_key_secret {
+        let key = secret_key(inv, config, name).await?;
+        headers.push(("Authorization".to_string(), bearer(&config.provider, &key)?));
+    }
     Ok(headers)
+}
+
+/// `urn:secret:<name>` for `provider`'s `api_key_secret`, or a refusal naming
+/// the provider and the rule. A name beginning with `-` is refused because
+/// ikigai-secret refuses one (its scope would read as an exclusion), and an
+/// empty one names nothing.
+fn secret_iri(provider: &str, name: &str) -> Result<Iri> {
+    let refuse = |why: &str| {
+        Error::Endpoint(format!(
+            "urn:llm:config: provider `{provider}` has an api_key_secret `{name}` that \
+             cannot name a secret: {why}"
+        ))
+    };
+    if name.is_empty() {
+        return Err(refuse("it is empty"));
+    }
+    if name.starts_with('-') {
+        return Err(refuse("a secret name never begins with `-`"));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "/?#".contains(c))
+    {
+        return Err(refuse(
+            "it holds whitespace, a control character, `/`, `?` or `#`",
+        ));
+    }
+    Iri::parse(format!("urn:secret:{name}")).map_err(|e| refuse(&e.to_string()))
+}
+
+/// The key `config` names by `api_key_secret`, read through the kernel at
+/// request time: a Source on `urn:secret:<name>` under the caller's capability
+/// narrowed to `urn:cap:secret:read:<name>`, so this module reaches that one
+/// secret and nothing else the caller may read. Surrounding whitespace is
+/// trimmed (a secret written with `echo` ends in a newline; no Bearer token
+/// holds whitespace).
+///
+/// A failure keeps its class (`denied` for a caller without the grant, `not
+/// found` for an absent secret) and names the provider and the SECRET — never
+/// a value: on failure there is none, and on success the key goes only into the
+/// `Authorization` header, where [`bearer`] refuses one that is not a token
+/// without quoting it.
+async fn secret_key(inv: &Invocation<'_>, config: &OpenAiConfig, name: &str) -> Result<String> {
+    let target = secret_iri(&config.provider, name)?;
+    let scope = format!("urn:cap:secret:read:{name}");
+    let context = |m: &str| {
+        format!(
+            "urn:llm:{}: api_key_secret `{name}` could not be read ({m})",
+            config.provider
+        )
+    };
+    let repr = inv
+        .issue_attenuated(Request::new(Verb::Source, target), [scope])
+        .await
+        .map_err(|e| with_context(e, context))?;
+    let key = String::from_utf8(repr.bytes)
+        .map_err(|_| Error::Endpoint(context("the secret is not UTF-8")))?;
+    Ok(key.trim().to_string())
 }
 
 /// The `Authorization` value for `provider`'s key: the ecosystem's one Bearer

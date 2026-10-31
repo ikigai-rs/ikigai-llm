@@ -128,12 +128,40 @@ load-time form of "the logical config aliases to file-or-code"):
     "big":    { "base_url": "http://localhost:11434/v1", "model": "llama3.1:70b" },
     "rapid":  { "base_url": "http://localhost:8000/v1",
                 "caps": { "cost": "local", "vendor": "mlx" } },
-    "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o", "api_key": "…" }
+    "remote": { "base_url": "https://api.example.com/v1", "model": "gpt-4o",
+                "api_key_secret": "remote-api-key" }
   }
 }
 ```
 
-An `api_key` goes out as `Authorization: Bearer <key>`, built by
+### Keys live in ikigai-secret, named by `api_key_secret`
+A provider that needs a key **names** it: `api_key_secret` is the name of an
+[`ikigai-secret`](https://crates.io/crates/ikigai-secret) secret, read at
+request time by issuing `urn:secret:<name>` through the kernel. The read runs
+under the caller's capability narrowed to `urn:cap:secret:read:<name>`, so the
+caller needs that grant beside `urn:cap:net:<host>`, and this module reaches
+that one secret and nothing else the caller can read. The host mounts the
+secrets space (`ikigai_secret::space`) beside this one. The key is never held
+in the registry, never cached, and never reported: `urn:llm:config` shows the
+secret's name, which is not a secret. Surrounding whitespace is trimmed, so a
+secret stored with `echo` works.
+
+A secret that cannot be read refuses the request before anything is sent,
+naming the provider and the secret, never a value: an absent secret is
+`not found` (`urn:llm:remote: api_key_secret `remote-api-key` could not be read
+(not found: no secret `remote-api-key`)`), a caller without the grant is
+`denied`. A provider may not give both `api_key` and `api_key_secret`, and a
+name that cannot name a secret (empty, beginning with `-`, or holding
+whitespace, `/`, `?` or `#`) is refused when the file loads.
+
+**An inline `api_key` is deprecated.** It still loads and still works, but it
+puts the key in plain text in the registry file, and loading one logs a line
+on stderr naming the provider (never the key). To move it, store the key
+once as a secret (through ikigai-secret's write face, a Sink on
+`urn:secret:remote-api-key`), then replace `"api_key": "sk-…"` with
+`"api_key_secret": "remote-api-key"`.
+
+Either way the key goes out as `Authorization: Bearer <key>`, built by
 `ikigai_http::auth::bearer`, so it must be an RFC 6750 `b64token`: letters,
 digits and `-._~+/`, then any number of `=`. Every key the hosted providers
 issue fits (`sk-proj-…`, `sk-ant-…`, `gsk_…`, `AIza…`). A key you choose for a
@@ -429,6 +457,28 @@ Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
   binding a door by one could not be declared. See [Endpoint ids](#endpoint-ids).
 - Tests: each endpoint's `name()` equals its description's id, and two
   providers in one space bind eight distinct ids.
+
+**Also in 0.19.0: provider keys in ikigai-secret** (ledger #2691), **BREAKING for code that builds an
+`OpenAiConfig` with a struct literal**: the public struct gains a field. Both changes ship in this one
+unreleased minor.
+
+- **A provider's key can live in ikigai-secret.** `api_key_secret` (in
+  `llm.json`, and `OpenAiConfig::api_key_secret`) names a secret read through
+  `urn:secret:<name>` at request time, under the caller's capability narrowed
+  to `urn:cap:secret:read:<name>`, for the ask and for every probe (listing,
+  liveness, discovery). See [Keys live in
+  ikigai-secret](#keys-live-in-ikigai-secret-named-by-api_key_secret).
+- **An inline `api_key` is deprecated**, still working: loading one logs a
+  line naming the provider, never the key.
+- **Refused at load:** a provider giving both `api_key` and `api_key_secret`,
+  and an `api_key_secret` that cannot name a secret.
+- `urn:llm:config` reports each provider's `api_key_secret` (the name).
+- No new runtime dependency: the secret is read through the kernel.
+  `ikigai-secret` 0.3 is a dev-dependency for `tests/secret_key.rs`, which runs
+  the real secrets space over a scratch file store: a named secret
+  authenticates the ask and every probe, an absent secret refuses naming it
+  and sends nothing, a caller without the grant (or with another secret's) is
+  denied, and no error or face carries the key.
 
 ## 0.17.1 (unreleased)
 

@@ -69,6 +69,11 @@ futures = "0.3"
 # 0.12.0 adds BODIES and BODY-INPUTS by default; the suite shares the kernel
 # space so deterministic endpoints are actually probed (ledger #2576).
 ikigai-conformance = "0.12.0"
+# The real secrets space (`urn:secret:{name}`) over its file store in a scratch
+# directory, for `tests/secret_key.rs`: a provider's `api_key_secret` is read
+# through it (ledger #2691). Dev-only: the library issues `urn:secret:<name>`
+# through the kernel and links no secrets crate. "0.3.0" admits 0.3.x only.
+ikigai-secret = "0.3.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
