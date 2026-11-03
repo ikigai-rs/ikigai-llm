@@ -714,7 +714,7 @@ impl Endpoint for AskFacade {
     }
 
     fn describe(&self) -> Description {
-        ask_description(
+        let description = ask_description(
             "llm-ask",
             "Ask an LLM: route to a backend (provider=, else needs= resolved over the \
              trait profiles, else the configured default) and return the completion.",
@@ -733,7 +733,19 @@ impl Endpoint for AskFacade {
                 )
                 .class(XSD_STRING)
                 .optional(),
-        )
+        );
+        // The provider is chosen at invocation time. Declare the parameterized
+        // floor here; the routed backend checks the exact provider's use scope.
+        if self
+            .registry
+            .providers
+            .iter()
+            .any(|p| p.api_key_secret.is_some())
+        {
+            description.requires("urn:cap:llm:use:*")
+        } else {
+            description
+        }
     }
 }
 
@@ -1228,8 +1240,7 @@ fn fails_like_an_origin(description: Description) -> Description {
 
 /// `urn:llm:config` — reports the effective registry (default + configured
 /// providers), with API keys **redacted** and any `user:password@` removed from
-/// a `base_url`, so the resource never leaks a secret. Those are the only two
-/// secret-bearing fields a provider entry has.
+/// a `base_url`. Secret-store names are redacted too: this resource is public.
 pub struct ConfigEndpoint {
     registry: Registry,
 }
@@ -1256,9 +1267,9 @@ impl Endpoint for ConfigEndpoint {
                     // stays a pure config read — it never probes.
                     "model": p.default_model,
                     "api_key": p.api_key.as_ref().map(|_| "***"),
-                    // A secret's NAME is not the secret: reported verbatim, so
-                    // an operator can see which secret a provider reads.
-                    "api_key_secret": p.api_key_secret,
+                    // This resource is public; do not expose the host's
+                    // secret-store names, even to a caller allowed to use a key.
+                    "api_key_secret": p.api_key_secret.as_ref().map(|_| "***"),
                 }),
             );
         }
@@ -1279,7 +1290,7 @@ impl Endpoint for ConfigEndpoint {
         Description::new("llm-config")
             .summary(
                 "The effective LLM provider registry (default + configured backends; \
-                 API keys and URL credentials redacted).",
+                 API keys, secret names, and URL credentials redacted).",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)

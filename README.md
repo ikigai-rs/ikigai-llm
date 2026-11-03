@@ -134,6 +134,27 @@ load-time form of "the logical config aliases to file-or-code"):
 }
 ```
 
+### Caller capabilities
+
+Operators mounting this module in a host such as
+[ikigai-cli](https://github.com/ikigai-rs/ikigai-cli) must give a caller of a
+provider with `api_key_secret` both `urn:cap:net:<host>` (including the port
+when scoped to a port) and `urn:cap:llm:use:<provider>`. For the `remote`
+example above, grant `urn:cap:net:api.example.com` and
+`urn:cap:llm:use:remote`. The host supplies the `SecretReader`; the caller
+does not need a secret-read grant.
+
+When any configured provider uses `api_key_secret`, the facade declares
+`urn:cap:llm:use:*` beside `urn:cap:net:*`: the action manifold offers
+`urn:llm:ask` only to callers holding some provider-use grant. The routed
+backend still checks the exact provider. In a mixed registry, a caller with
+only network access can use an unkeyed provider directly through
+`urn:llm:<provider>:ask`; the facade requires a use grant. A registry with
+only unkeyed providers requires only network access.
+
+Host operator guides can link directly to
+[this capability reference](https://github.com/ikigai-rs/ikigai-llm#caller-capabilities).
+
 ### Keys live in ikigai-secret, named by `api_key_secret`
 A provider that needs a key **names** it: `api_key_secret` is the name of an
 [`ikigai-secret`](https://crates.io/crates/ikigai-secret) secret. The **host**
@@ -154,9 +175,10 @@ selection faces (`urn:llm:models`, `urn:llm:select`, the facade's `needs=`)
 probe a keyed provider only for a caller holding its use scope; for anyone
 else nothing is read and nothing is sent.
 
-The key is never held in the registry, never cached, and never reported:
-`urn:llm:config` shows the secret's name, which is not a secret. Surrounding
-whitespace is trimmed, so a secret stored with `echo` works.
+The key is never held in the registry, never cached, and never reported.
+`urn:llm:config` masks both inline keys and secret names as `***` for every
+caller, including operators; inspect the host's registry file to find the name.
+Surrounding whitespace is trimmed, so a secret stored with `echo` works.
 
 A secret that cannot be read refuses the request before anything is sent,
 naming the provider and the secret, never a value: an absent secret is
@@ -493,7 +515,7 @@ unreleased minor.
   line naming the provider, never the key.
 - **Refused at load:** a provider giving both `api_key` and `api_key_secret`,
   and an `api_key_secret` that cannot name a secret.
-- `urn:llm:config` reports each provider's `api_key_secret` (the name).
+- `urn:llm:config` masks each provider's `api_key_secret` name as `***`.
 - No new runtime dependency: the host's reader is a one-method trait.
   `ikigai-secret` 0.3 is a dev-dependency for `tests/secret_key.rs`, which runs
   the real secrets space over a scratch file store beside a host reader over
