@@ -386,17 +386,95 @@ fn a_secret_that_is_not_a_token_is_refused_without_echoing_it() {
     assert!(stub.sent().is_empty());
 }
 
-/// `urn:llm:config` reports the secret's NAME (not a secret) and no value.
+/// Public configuration must not disclose the host's secret-store names.
 #[test]
-fn the_config_face_names_the_secret_and_holds_no_key() {
+fn the_config_face_redacts_secret_names_for_every_caller() {
     let store = Store::new("config");
     store.backend().set(SECRET, KEY.as_bytes()).unwrap();
-    let k = kernel(Stub::new(), &store, NAMED);
-    let body = text(&run(&k, get("urn:llm:config"), &Capability::root()).unwrap());
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["providers"]["remote"]["api_key_secret"], SECRET);
-    assert_eq!(v["providers"]["remote"]["api_key"], serde_json::Value::Null);
-    assert!(!body.contains(KEY));
+    let stub = Stub::new();
+    let k = kernel(Arc::clone(&stub), &store, NAMED);
+    for caller in [Capability::root(), granted(), scoped(&[])] {
+        let body = text(&run(&k, get("urn:llm:config"), &caller).unwrap());
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["providers"]["remote"]["api_key_secret"], "***");
+        assert_eq!(v["providers"]["remote"]["api_key"], serde_json::Value::Null);
+        assert!(!body.contains(SECRET), "secret name leaked: {body}");
+        assert!(!body.contains(KEY));
+    }
+    assert!(stub.sent().is_empty());
+}
+
+#[test]
+fn the_facade_manifold_requires_a_use_grant_for_a_keyed_registry() {
+    let store = Store::new("manifold");
+    store.backend().set(SECRET, KEY.as_bytes()).unwrap();
+    let stub = Stub::new();
+    let k = kernel(Arc::clone(&stub), &store, NAMED);
+    let net_only = scoped(&["urn:cap:net:api.example.com"]);
+    assert!(matches!(
+        run(&k, ask("urn:llm:ask"), &net_only),
+        Err(Error::Denied(_))
+    ));
+    let manifold = text(&run(&k, get("urn:kernel:actions"), &net_only).unwrap());
+    assert!(
+        !manifold.contains("urn:llm:ask"),
+        "offered a refused action: {manifold}"
+    );
+    for caller in [
+        granted(),
+        scoped(&["urn:cap:net:api.example.com", "urn:cap:llm:use:other"]),
+    ] {
+        let manifold = text(&run(&k, get("urn:kernel:actions"), &caller).unwrap());
+        assert!(
+            manifold.contains("urn:llm:ask"),
+            "wildcard floor: {manifold}"
+        );
+    }
+    let requires = k
+        .describe(&Iri::parse("urn:llm:ask").unwrap())
+        .unwrap()
+        .action_specs()
+        .into_iter()
+        .flat_map(|s| s.requires)
+        .collect::<Vec<_>>();
+    assert_eq!(requires, ["urn:cap:net:*", "urn:cap:llm:use:*"]);
+    assert!(stub.sent().is_empty());
+}
+
+/// A mixed registry has the wildcard floor, but unkeyed direct actions and
+/// registries without secret-backed providers keep their network-only access.
+#[test]
+fn unkeyed_providers_remain_available_without_a_use_grant() {
+    let store = Store::new("mixed");
+    let mut registry: serde_json::Value = serde_json::from_str(NAMED).unwrap();
+    registry["providers"]["local"] = serde_json::json!({
+        "base_url": "https://api.example.com/v1", "model": "local-model"
+    });
+    let stub = Stub::new();
+    let k = kernel(Arc::clone(&stub), &store, &registry.to_string());
+    let net_only = scoped(&["urn:cap:net:api.example.com"]);
+    let manifold = text(&run(&k, get("urn:kernel:actions"), &net_only).unwrap());
+    assert!(!manifold.lines().any(|line| line == "urn:llm:ask"));
+    assert!(manifold.contains("urn:llm:local:ask"));
+    let config = text(&run(&k, get("urn:llm:config"), &net_only).unwrap());
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert!(config["providers"]["local"]["api_key_secret"].is_null());
+
+    registry["providers"]
+        .as_object_mut()
+        .unwrap()
+        .remove("remote");
+    registry["default"] = "local".into();
+    let k = kernel(Arc::clone(&stub), &store, &registry.to_string());
+    let manifold = text(&run(&k, get("urn:kernel:actions"), &net_only).unwrap());
+    assert!(manifold.lines().any(|line| line == "urn:llm:ask"));
+    // The stub refuses unauthenticated calls, proving the request reached it
+    // rather than being denied by the facade's capability floor.
+    assert!(matches!(
+        run(&k, ask("urn:llm:ask"), &net_only),
+        Err(Error::Refused(_))
+    ));
+    assert_eq!(stub.sent().len(), 1);
 }
 
 #[test]
