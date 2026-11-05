@@ -480,7 +480,20 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
-## 0.19.0 (unreleased)
+## 0.20.0 (unreleased)
+
+Minor, **BREAKING for hosts and consumers**: this crate's public API now speaks
+ikigai-core 0.3 types (ledger #2965, the scoped content store).
+
+- **`ikigai-core` moves to 0.3.0.** Held content is scoped to whoever delivered
+  it, and `ContentStore::put` and `put_replay` are root-only. This crate calls
+  neither, so its behavior does not change.
+- **`ikigai-http` moves to 0.6.0**, its release on core 0.3. A host shares one
+  transport between `ikigai-http`'s space and this one, so move both together.
+- Dev-dependencies: `ikigai-conformance` moves to 0.14.0 and `ikigai-secret` to
+  0.4.0, their releases on core 0.3, so the test build links one core.
+
+## 0.19.0
 
 Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
 
@@ -496,7 +509,7 @@ Minor, **BREAKING for anything that names an endpoint by id** (ledger #2637).
 
 **Also in 0.19.0: provider keys in ikigai-secret** (ledger #2691), **BREAKING for code that builds an
 `OpenAiConfig` with a struct literal**: the public struct gains a field. Both changes ship in this one
-unreleased minor.
+minor.
 
 - **A provider's key can live in ikigai-secret.** `api_key_secret` (in
   `llm.json`, and `OpenAiConfig::api_key_secret`) names a secret the host reads

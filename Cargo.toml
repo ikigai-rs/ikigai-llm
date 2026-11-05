@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 # The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
 # on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
@@ -25,8 +25,12 @@ categories = ["web-programming"]
 # `Description::fails`, all of which first ship in 0.1.108; ikigai-http 0.3.0 requires it
 # too. 0.2.0 is the streams release (ledger #2261); the old "0.1.108" pin meant <0.2.0
 # under 0.x rules, so moving to 0.2 is deliberate. Core's types are in this crate's API,
-# so the move is breaking for consumers, hence llm 0.17.0. "0.2.0" admits 0.2.x only.
-ikigai-core = "0.2.1"
+# so the move is breaking for consumers, hence llm 0.17.0. 0.3.0 is the scoped content
+# store (ledger #2965): held content is scoped to whoever delivered it, and
+# ContentStore::put/put_replay are root-only. This crate calls neither, but core's types
+# are still in its API, so the move is breaking again, hence llm 0.20.0. "0.3.0" admits
+# 0.3.x only.
+ikigai-core = "0.3.0"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
 # client or executor baked into this crate. `net_allows_port` (since 0.1.7) is the
@@ -42,8 +46,10 @@ ikigai-core = "0.2.1"
 # breaking for consumers, hence llm 0.16.0. 0.4.0 is the ikigai-http release on
 # ikigai-core 0.2.0 (ledger #2261): with core on 0.2, http must be too or the graph
 # links two cores. 0.5.0 is conditional revalidation (ledger #2535), which moves the
-# public HttpTransport again, hence llm 0.18.0. A ceiling too: "0.5.0" admits 0.5.x only.
-ikigai-http = "0.5.0"
+# public HttpTransport again, hence llm 0.18.0. 0.6.0 is the ikigai-http release on
+# ikigai-core 0.3.0 (ledger #2965): with core on 0.3, http must be too or the graph links
+# two cores. A ceiling too: "0.6.0" admits 0.6.x only.
+ikigai-http = "0.6.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -68,13 +74,15 @@ futures = "0.3"
 # ledger #2261), and turns DATATYPES and FAILURES on by default.
 # 0.12.0 adds BODIES and BODY-INPUTS by default; the suite shares the kernel
 # space so deterministic endpoints are actually probed (ledger #2576).
-ikigai-conformance = "0.12.0"
+# 0.14.0 is the release on ikigai-core 0.3.0 (ledger #2965), so the test build links one core.
+ikigai-conformance = "0.14.0"
 # The real secrets space (`urn:secret:{name}`) over its file store in a scratch
 # directory, for `tests/secret_key.rs`: a provider's `api_key_secret` is read
 # from it by the test host's `SecretReader` (ledger #2691, #2706), and the space
 # proves a model caller cannot read the key there. Dev-only: the library takes
-# the host's reader and links no secrets crate. "0.3.0" admits 0.3.x only.
-ikigai-secret = "0.3.0"
+# the host's reader and links no secrets crate. 0.4.0 is the release on ikigai-core
+# 0.3.0 (ledger #2965), so the test build links one core. "0.4.0" admits 0.4.x only.
+ikigai-secret = "0.4.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
