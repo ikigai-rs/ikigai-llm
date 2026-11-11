@@ -2093,7 +2093,8 @@ impl Endpoint for SelectEndpoint {
 }
 
 /// POST a JSON payload to a provider, mapping transport failure to a transient
-/// error ([`transport_failure`]; a 4xx/5xx is still a response — callers decide).
+/// error ([`transport_failure`]; a 3xx is refused, [`refuse_redirect`]; a 4xx/5xx is
+/// still a response — callers decide).
 async fn post_json(
     transport: &dyn HttpTransport,
     url: &str,
@@ -2120,6 +2121,30 @@ async fn post_response(
         })
         .await
         .map_err(|e| transport_failure(&e, url))
+        .and_then(|response| refuse_redirect(response, url))
+}
+
+/// A provider's 3xx, refused with a typed [`Error::Endpoint`] that names the status
+/// and the `Location` (ledger #3471). A host transport returns a redirect as-is
+/// (ikigai-http's contract), and this crate calls the transport directly, so a 3xx
+/// reaches it. It is never followed here: following is ikigai-http's endpoint's job,
+/// under the capability ACL re-run per hop, and a request body is never replayed at
+/// a host the caller did not vet. Nor is it read as an answer: its body is the
+/// redirect's, not the provider's. Every other status passes through unchanged.
+fn refuse_redirect(response: HttpResponse, url: &str) -> Result<HttpResponse> {
+    if !(300..400).contains(&response.status) {
+        return Ok(response);
+    }
+    let location = response
+        .header("location")
+        .map(|l| format!("Location: {}", redacted_url(l)))
+        .unwrap_or_else(|| "no Location".to_string());
+    Err(Error::Endpoint(format!(
+        "llm: provider at {} returned {} redirect, not followed (set base_url to where \
+         the provider is); {location}",
+        redacted_url(url),
+        response.status
+    )))
 }
 
 /// A provider's answer with its body collected. ikigai-http 0.4.0 hands a response
@@ -2574,6 +2599,7 @@ async fn get(
         })
         .await
         .map_err(|e| transport_failure(&e, &url))
+        .and_then(|response| refuse_redirect(response, &url))
 }
 
 /// `urn:llm:<provider>:installed` — what the provider can actually serve right
