@@ -25,7 +25,8 @@ conformance claim. Adapted from the
 - **Refusals** (`src/lib.rs`): a config that does not hold (`urn:llm:config: provider … declares
   …`), an input outside its form (`as`, `temperature`, `max_tokens`, `needs`), no backend that
   satisfies `needs=`, a host the capability does not reach, a model that could not be
-  discovered, and a backend's failure typed by status.
+  discovered, a backend's failure typed by status, and a backend's redirect, which names the
+  status and the `Location` and is never followed.
 - **`examples/ask.rs`**, which prints the model, the prompt, and the answer or the error.
 
 **The completion text is the model's, not this repository's.** This crate does not change,
@@ -41,6 +42,8 @@ through with the caller's prompt cut out.
   endpoint serves, `temperature` and `max_tokens` say the form expected, a config error names the
   provider and the fix (`keep only api_key_secret`), no backend for `needs=` lists the providers
   and points to `urn:llm:models`, and a denial names the host and the capability it needs.
+- A backend's redirect names its status and its `Location` (with any `user:password@` removed)
+  and says the fix (`set base_url to where the provider is`); it is never followed.
 - A backend's error page or plain-text refusal is described (status, media type, length), never
   forwarded, and a URL's `user:password@` is removed from error text.
 - No color is written; meaning is in words.
@@ -51,6 +54,8 @@ through with the caller's prompt cut out.
 - `tests/error_bodies.rs`: `an_html_error_page_is_described_not_forwarded`,
   `a_plain_text_refusal_is_described_not_forwarded`, `a_json_error_keeps_its_reason`.
 - `tests/transport_errors.rs` pins the type of each failure against scratch servers.
+- `tests/redirects.rs`: `a_redirected_ask_is_refused_naming_status_and_location`,
+  `a_redirect_without_location_is_still_refused`.
 - These pin what reaches the caller, not how it reads. **No automated accessibility checker,
   browser or assistive technology has been used on this output.**
 
