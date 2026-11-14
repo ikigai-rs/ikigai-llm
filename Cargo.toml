@@ -48,8 +48,10 @@ ikigai-core = "0.3.0"
 # links two cores. 0.5.0 is conditional revalidation (ledger #2535), which moves the
 # public HttpTransport again, hence llm 0.18.0. 0.6.0 is the ikigai-http release on
 # ikigai-core 0.3.0 (ledger #2965): with core on 0.3, http must be too or the graph links
-# two cores. A ceiling too: "0.6.0" admits 0.6.x only.
-ikigai-http = "0.6.0"
+# two cores. 0.7.0 requires cut authority for HTTP writes and makes `Method` non-exhaustive
+# (ledger #1880): `HttpTransport` is public here, so the next release is llm 0.21.0. A ceiling
+# too: "0.7.0" admits 0.7.x only.
+ikigai-http = "0.7.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
