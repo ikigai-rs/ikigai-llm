@@ -37,7 +37,10 @@ use ikigai_http::{HttpRequest, HttpResponse, HttpTransport, Method, DEFAULT_MAX_
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+mod embed;
 mod streaming;
+
+pub use embed::{EmbedBackend, EmbedFacade};
 
 /// The capability every backend call requires — reaching a server, even on
 /// localhost, is a network act. Declared in the **wildcard form** (the
@@ -227,6 +230,11 @@ pub struct OpenAiConfig {
     /// The declared capability profile (what `urn:llm:models` reports and
     /// selection will reason over). Empty by default.
     pub caps: Caps,
+    /// Whether `urn:llm:<provider>:embed` may send text to this provider although it
+    /// does not declare `cost: "local"` (`"embed_remote": true` in a registry file).
+    /// `false` by default: text is embedded by a local model only unless the
+    /// configuration says otherwise.
+    pub embed_remote: bool,
 }
 
 impl OpenAiConfig {
@@ -244,6 +252,7 @@ impl OpenAiConfig {
                 vendor: Some("ollama".to_string()),
                 ..Caps::default()
             },
+            embed_remote: false,
         }
     }
 
@@ -260,6 +269,7 @@ impl OpenAiConfig {
             api_key_secret: None,
             secrets: None,
             caps: Caps::default(),
+            embed_remote: false,
         }
     }
 }
@@ -329,6 +339,8 @@ impl Registry {
             api_key_secret: Option<String>,
             #[serde(default)]
             caps: Caps,
+            #[serde(default)]
+            embed_remote: bool,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -349,6 +361,7 @@ impl Registry {
                 api_key_secret: e.api_key_secret,
                 secrets: None,
                 caps: e.caps,
+                embed_remote: e.embed_remote,
             })
             .collect();
         // A declared load shape is a concurrency, so 0 is not a small value —
@@ -582,7 +595,9 @@ impl From<OpenAiConfig> for Registry {
 /// Binds `urn:llm:ask` (the facade), a `urn:llm:<provider>:ask` / `:up` /
 /// `:installed` / `:model` for every provider in the registry (each directly
 /// addressable and catalog-advertised with its own model/base_url), and
-/// `urn:llm:config` (the effective registry, keys redacted).
+/// `urn:llm:config` (the effective registry, keys redacted). A provider declaring
+/// `vendor: "ollama"` also gets `urn:llm:<provider>:embed`, and when any does,
+/// `urn:llm:embed` is bound beside `urn:llm:ask` (see [`EmbedFacade`]).
 /// Accepts a [`Registry`] or — via `From<OpenAiConfig>` — a single [`OpenAiConfig`].
 /// The host supplies the [`HttpTransport`]. A provider naming an `api_key_secret`
 /// needs a [`SecretReader`] too: mount with [`space_with_secrets`], or set
@@ -624,6 +639,18 @@ pub fn space(transport: Arc<dyn HttpTransport>, registry: impl Into<Registry>) -
                 Exact::new(format!("urn:llm:{}:model", provider.provider)),
                 ModelEndpoint::new(provider.clone(), Arc::clone(&transport)),
             );
+        if embed::embeds(provider) {
+            space = space.bind(
+                Exact::new(format!("urn:llm:{}:embed", provider.provider)),
+                EmbedBackend::new(provider.clone(), Arc::clone(&transport)),
+            );
+        }
+    }
+    if registry.providers.iter().any(embed::embeds) {
+        space = space.bind(
+            Exact::new("urn:llm:embed"),
+            EmbedFacade::new(registry.clone()),
+        );
     }
     space
 }

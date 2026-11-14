@@ -12,6 +12,9 @@ addressable (`urn:llm:<provider>:ask`).
   That single shape covers **Ollama, vLLM, `llama.cpp`'s server, `mlx_lm.server`,
   and LM Studio** — they differ only in `base_url`, `default_model`, and whether a
   key is needed.
+- **`urn:llm:embed`** and **`urn:llm:<provider>:embed`** — text to a vector from a
+  **named** model, over Ollama's `/api/embed`; the answer names the model and its
+  digest. See [Embeddings](#embeddings-urnllmembed).
 
 Single-turn, `urn:cap:net`-gated; text completions support streaming bodies. The gate judges
 host, **port** and path exactly as `ikigai-http`'s own endpoints do: a grant on
@@ -444,6 +447,46 @@ source urn:fn:conditional if=urn:llm:ollama:up then=urn:data:jury else=urn:data:
 Uncacheable (liveness is a live fact); a capability that can't reach the host is
 an error, not `false` (denied ≠ down).
 
+## Embeddings: `urn:llm:embed`
+
+Text in, a vector out, from a model the caller **names**: there is no default
+model, because two vectors are comparable only when the same weights made them.
+
+```text
+source urn:llm:embed model=embeddinggemma text=<text>
+→ {"vector":[0.0123,…],"model":"embeddinggemma:latest","digest":"8546…","dimensions":768}
+```
+
+- **`urn:llm:<provider>:embed`** is bound for each provider declaring
+  `vendor: "ollama"` (the opt-in that already admits `/api/tags` and `/api/show`).
+  It reads the model's installed name and digest from `/api/tags`, then posts the
+  text to `/api/embed`. An OpenAI-compatible `/v1/embeddings` names no digest, so it
+  is not offered yet. **`urn:llm:embed`** routes to one (`provider=`, else the
+  configured default), and is bound when at least one provider embeds.
+- **The answer names the model and its digest** (`as=application/json`, the only
+  face): `vector`, `model` (the installed name, so `embeddinggemma` and
+  `embeddinggemma:latest` compare equal), `digest` (as `/api/tags` lists it) and
+  `dimensions`. Compare vectors only when `model` and `digest` match.
+- **A model that is not installed is refused**, `NotFound`, naming it and the fix
+  (`ollama pull <model>`), before the text is sent. So is a listing that gives the
+  model no digest.
+- **Local only, unless the configuration says otherwise.** The provider must
+  declare `cost: "local"` (`OpenAiConfig::ollama` does), or its registry entry must
+  set `"embed_remote": true`. Otherwise the call is refused (`Denied`) and nothing
+  is sent. A provider that declares no cost is not known to be local.
+- **Cacheable on the text and the model.** The kernel's cache key is a digest of
+  the request, so the cache holds the vector, not the text. The answer hangs on
+  `urn:llm:config` and on `urn:llm:<provider>:installed`: a host that re-pulls a
+  model cuts that thread. A copy served before the cut still names the digest that
+  made it.
+- **The text is data, never quoted.** It goes to the backend only: never into an
+  error (a server that echoes it has it cut to `[prompt]`) and never into a trace
+  note (those carry the model, digest, provider and cost).
+
+Gated like every provider call (`urn:cap:net:<host>`, and the provider's
+`urn:cap:llm:use:<provider>` when its key lives in ikigai-secret). Pinned against a
+fake backend by `tests/embed.rs`, and walked by `tests/conformance.rs`.
+
 ## Failures are typed, and each type says who may retry it
 
 Every failure to get an answer is typed by `ikigai-http`'s one table
@@ -479,6 +522,16 @@ its words (`timed out`, `timeout`) with the URL removed; anything else
 unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
+
+## 0.21.0 (unreleased)
+
+- **`urn:llm:embed` and `urn:llm:<provider>:embed`** (ledger #3690): text to a
+  vector from a named model, over Ollama's `/api/embed`, answering the model's
+  installed name and digest. See [Embeddings](#embeddings-urnllmembed).
+- **`OpenAiConfig` gains `embed_remote`** (`"embed_remote": true` in a registry
+  file), `false` by default. Breaking for a struct literal that lists every field;
+  `..OpenAiConfig::ollama(..)` is unaffected.
+- `ikigai-http` moves to 0.7.0 (#44).
 
 ## 0.20.0 (unreleased)
 
@@ -752,7 +805,8 @@ hierarchy; `ik:Vision ⊑ ik:Multimodal`), **live-reload** (make `urn:llm:config
 live resource that sources the file under a golden thread), **transrepted config**
 (author YAML/Turtle, transrept through the kernel), `key_ref` → the secrets infra,
 deterministic caching, json mode/tools, in-process `llama.cpp` (FFI) + MLX (pyo3),
-heartbeat/idle limits for live feeds, and `urn:llm:embed`.
+heartbeat/idle limits for live feeds, and embeddings over an OpenAI-compatible
+`/v1/embeddings` (once a digest can be named for it).
 
 ## Accessibility
 

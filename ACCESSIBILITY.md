@@ -18,6 +18,8 @@ conformance claim. Adapted from the
 - **A model's answer** from `urn:llm:ask` and `urn:llm:<provider>:ask` (`src/lib.rs`, streamed
   through `src/streaming.rs`): as `text/plain`, the completion text exactly as the model wrote
   it; as `application/json`, an envelope of that text, the model, the finish reason and usage.
+- **An embedding** from `urn:llm:embed` and `urn:llm:<provider>:embed` (`src/embed.rs`): JSON
+  numbers with the model's name, its digest and the dimensions, for programs rather than people.
 - **Its own short answers**: the model id (`urn:llm:<provider>:model`), `true` or `false`
   (`urn:llm:<provider>:up`), a newline list of installed models
   (`urn:llm:<provider>:installed`), the winning backend's IRI (`urn:llm:select`), and the
@@ -26,7 +28,9 @@ conformance claim. Adapted from the
   …`), an input outside its form (`as`, `temperature`, `max_tokens`, `needs`), no backend that
   satisfies `needs=`, a host the capability does not reach, a model that could not be
   discovered, a backend's failure typed by status, and a backend's redirect, which names the
-  status and the `Location` and is never followed.
+  status and the `Location` and is never followed. For an embedding: a model that is not
+  installed (named, with `ollama pull <model>` as the fix), a provider not declared local
+  (naming `embed_remote: true`), and a provider that does not embed (listing those that do).
 - **`examples/ask.rs`**, which prints the model, the prompt, and the answer or the error.
 - **Documentation**: `README.md`, `AGENTS.md` and this statement are Markdown, rendered by
   GitHub or read in an editor; Rust API documentation is generated from source comments.

@@ -5,10 +5,10 @@
 //!
 //! Every backend action reaches an inference server, and CI has none. So
 //! [`Stub`] is an HTTP/1.1 listener on `127.0.0.1` at an ephemeral port that
-//! answers the four routes this module speaks — the OpenAI-compatible
+//! answers the five routes this module speaks — the OpenAI-compatible
 //! `POST /v1/chat/completions` and `GET /v1/models`, and Ollama's native
-//! `GET /api/tags` and `POST /api/show` — with a canned model, `tiny:1b`, that
-//! never echoes a prompt. It records every request and counts every
+//! `GET /api/tags`, `POST /api/show` and `POST /api/embed` — with a canned
+//! model, `tiny:1b`, that never echoes a prompt. It records every request and counts every
 //! connection it accepts: the count is how a test proves a socket was NEVER
 //! opened. [`Client`] is the smallest [`HttpTransport`] that speaks to it (one
 //! blocking exchange per request), injected the way a host injects `ureq`.
@@ -97,7 +97,7 @@
 //!   ([`the_manifold_states_the_contract`]): every input has a class, every
 //!   action that reaches the network, and selection, declares exactly
 //!   `urn:cap:net:*` and the config reads declare nothing, and only `prompt` /
-//!   `needs` are required. That a required input is really required is
+//!   `needs` / `text` and `model` are required. That a required input is really required is
 //!   `REQUIRED`'s since conformance 0.8.0 (PENDING #5/#49); which inputs are
 //!   required, and that no other one is, stays pinned here.
 
@@ -134,6 +134,9 @@ const CONFIG_THREAD: &str = "urn:llm:config";
 const LIMITED_MODEL: &str = "limited:1b";
 const LOCKED_MODEL: &str = "locked:1b";
 const RETRY_AFTER_SECS: u64 = 2;
+
+/// The digest the stub's `/api/tags` lists for [`MODEL`].
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// A prompt no stub answer, no description and no error may contain.
 const PROMPT: &str = "SECRET-PROMPT-7f3a-never-echoed";
@@ -289,8 +292,8 @@ impl Drop for Stub {
     }
 }
 
-/// The stub's script: Ollama's four routes under `/v1` (the OpenAI-compatible
-/// face) and `/api` (the native face); under `/echo/v1` a 400 whose body
+/// The stub's script: Ollama's routes under `/v1` (the OpenAI-compatible
+/// face) and `/api` (the native face: tags, show and embed); under `/echo/v1` a 400 whose body
 /// carries the request back beside its `error.message`; anything else a 404.
 /// A chat request naming [`LIMITED_MODEL`] is answered 429 with `Retry-After`,
 /// and one naming [`LOCKED_MODEL`] 401: the fake origin the `fails_under`
@@ -316,7 +319,10 @@ fn respond(method: &str, path: &str, request: &[u8]) -> (u16, &'static str, Vec<
         )),
         ("GET", "/v1/models") => ok(&format!(r#"{{"object":"list","data":[{{"id":"{MODEL}"}}]}}"#)),
         ("GET", "/api/tags") => ok(&format!(
-            r#"{{"models":[{{"name":"{MODEL}","size":1000}}]}}"#
+            r#"{{"models":[{{"name":"{MODEL}","size":1000,"digest":"{DIGEST}"}}]}}"#
+        )),
+        ("POST", "/api/embed") => ok(&format!(
+            r#"{{"model":"{MODEL}","embeddings":[[0.25,-0.5,1.0]]}}"#
         )),
         ("POST", "/api/show") => ok(
             r#"{"details":{"parameter_size":"1B"},"model_info":{"llama.context_length":4096},"capabilities":["completion"]}"#,
@@ -477,19 +483,40 @@ fn suite() -> Suite {
     )
 }
 
-/// The four endpoints every registry binds, then four per provider.
-fn endpoints(providers: usize) -> usize {
-    4 + 4 * providers
+/// [`suite`], plus the model the embedding actions must name: the suite's `x`
+/// is not installed on the stub, and a model that is not installed is refused.
+/// For a registry with a `vendor: "ollama"` provider, which binds them.
+fn embedding_suite() -> Suite {
+    ["llm-embed", "llm-ollama-embed"]
+        .into_iter()
+        .fold(suite(), |suite, id| {
+            suite.fixture(
+                Fixture::new(id, Verb::Source)
+                    .arg("model", MODEL)
+                    .arg("text", PROMPT),
+            )
+        })
+}
+
+/// The four endpoints every registry binds, then four per provider, and with
+/// `embedders` providers declaring `vendor: "ollama"`, one `:embed` each and the
+/// `urn:llm:embed` facade.
+fn endpoints(providers: usize, embedders: usize) -> usize {
+    4 + 4 * providers + if embedders > 0 { 1 + embedders } else { 0 }
 }
 
 /// The walk saw every endpoint, one Source action each, skipped no check, left
 /// only the expected live BODIES answers unprobed, and opted nothing out.
 /// An endpoint bound without a line here is held to a weaker standard.
-fn assert_shape(report: &Report, providers: usize, live: &[&str]) {
-    assert_eq!(report.endpoints, endpoints(providers), "{report}");
+fn assert_shape(report: &Report, providers: usize, embedders: usize, live: &[&str]) {
+    assert_eq!(
+        report.endpoints,
+        endpoints(providers, embedders),
+        "{report}"
+    );
     assert_eq!(
         report.actions,
-        endpoints(providers),
+        endpoints(providers, embedders),
         "one Source action each: {report}"
     );
     assert_eq!(
@@ -548,6 +575,7 @@ fn assert_stub_footprint(stub: &Stub, asks: usize) {
                     | ("GET", "/v1/models")
                     | ("GET", "/api/tags")
                     | ("POST", "/api/show")
+                    | ("POST", "/api/embed")
             ),
             "an unscripted route was requested: {} {}",
             r.method,
@@ -577,6 +605,7 @@ fn conforms_without_discovery() {
     assert_shape(
         &report,
         1,
+        0,
         &[
             "llm-ask",
             "llm-ollama-ask",
@@ -597,13 +626,19 @@ fn conforms_without_discovery() {
 fn conforms() {
     let stub = Stub::start();
     let report = walk(
-        origin_failures(suite().cacheable("llm-ollama-model")),
+        origin_failures(
+            embedding_suite()
+                .cacheable("llm-ollama-model")
+                .cacheable("llm-ollama-embed")
+                .cacheable("llm-embed"),
+        ),
         pinned(&stub),
     );
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(
         &report,
+        1,
         1,
         &[
             "llm-ask",
@@ -614,7 +649,11 @@ fn conforms() {
             "llm-ollama-installed",
         ],
     );
-    assert_eq!(report.declared.cacheable, ["llm-ollama-model"], "{report}");
+    assert_eq!(
+        report.declared.cacheable,
+        ["llm-ollama-model", "llm-ollama-embed", "llm-embed"],
+        "{report}"
+    );
     // One ask per action, and one per `fails_under` probe.
     assert_stub_footprint(&stub, 2 + ORIGIN_PROBES);
     assert_origin_failures(&report);
@@ -654,12 +693,18 @@ fn assert_origin_failures(report: &Report) {
 #[test]
 fn conforms_with_a_discovering_provider() {
     let stub = Stub::start();
-    let report = walk(suite(), discovering(&stub));
+    let report = walk(
+        embedding_suite()
+            .cacheable("llm-ollama-embed")
+            .cacheable("llm-embed"),
+        discovering(&stub),
+    );
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(
         &report,
         2,
+        1,
         &[
             "llm-ask",
             "llm-models",
@@ -673,7 +718,11 @@ fn conforms_with_a_discovering_provider() {
             "llm-server-model",
         ],
     );
-    assert!(report.declared.cacheable.is_empty(), "{report}");
+    assert_eq!(
+        report.declared.cacheable,
+        ["llm-ollama-embed", "llm-embed"],
+        "{report}"
+    );
     assert_stub_footprint(&stub, 3);
 }
 
@@ -727,10 +776,12 @@ fn scoped(scopes: &[&str]) -> Capability {
 }
 
 /// Every action that reaches the network, over the discovering registry: the
-/// facade, and per provider `:ask` / `:up` / `:installed`, plus the
-/// discovering provider's `:model`.
-const NETWORK_ACTIONS: [&str; 8] = [
+/// facades, and per provider `:ask` / `:up` / `:installed`, plus the
+/// discovering provider's `:model` and the `vendor: "ollama"` provider's `:embed`.
+const NETWORK_ACTIONS: [&str; 10] = [
     "urn:llm:ask",
+    "urn:llm:embed",
+    "urn:llm:ollama:embed",
     "urn:llm:ollama:ask",
     "urn:llm:ollama:up",
     "urn:llm:ollama:installed",
@@ -950,6 +1001,11 @@ fn declared_outputs_are_the_media_types_served() {
         ("urn:llm:ollama:installed", vec![json]),
         ("urn:llm:ollama:model", vec![]),
         ("urn:llm:server:model", vec![]),
+        ("urn:llm:embed", vec![("text", PROMPT), ("model", MODEL)]),
+        (
+            "urn:llm:ollama:embed",
+            vec![("text", PROMPT), ("model", MODEL), json],
+        ),
     ];
     let mut served_by_iri: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for (iri, args) in &calls {
@@ -1057,7 +1113,8 @@ fn a_prompt_never_appears_in_the_errors_this_module_composes() {
 /// The contract as the manifold states it: one Source action per endpoint,
 /// every input has a class, every network action and selection declare
 /// exactly the net wildcard and every config read declares nothing, and only
-/// `prompt` (the asks) and `needs` (selection) are required.
+/// `prompt` (the asks), `needs` (selection), and `text` and `model` (the
+/// embeddings: a model is always named) are required.
 #[test]
 fn the_manifold_states_the_contract() {
     let stub = Stub::start();
@@ -1093,6 +1150,8 @@ fn the_manifold_states_the_contract() {
             .collect();
         let expected: &[&str] = if iri.ends_with(":ask") {
             &["prompt"]
+        } else if iri.ends_with(":embed") {
+            &["text", "model"]
         } else if *iri == "urn:llm:select" {
             &["needs"]
         } else {
