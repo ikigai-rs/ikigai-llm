@@ -531,7 +531,18 @@ against scratch servers on 127.0.0.1.
 - **`OpenAiConfig` gains `embed_remote`** (`"embed_remote": true` in a registry
   file), `false` by default. Breaking for a struct literal that lists every field;
   `..OpenAiConfig::ollama(..)` is unaffected.
-- `ikigai-http` moves to 0.7.0 (#44).
+- **BREAKING for hosts and consumers: `ikigai-core` moves to 0.4.0** (scope
+  opacity, structured denials; the core 0.4.0 cascade, ledger #3893). This crate's
+  public API now speaks core 0.4 types, so a consumer on core 0.3 cannot mix them.
+  A refusal is now `Error::Denied(Denial)`; a denial this crate rewords keeps the
+  scopes the caller lacked. Nothing else changes.
+- `ikigai-http` moves to 0.7.0 (#44), then to 0.8.0, its release on core 0.4. A
+  host shares one transport between `ikigai-http`'s space and this one, so move
+  both together.
+- Dev-dependencies: `ikigai-conformance` moves to 0.15.0, its release on core 0.4.
+  `ikigai-secret` has no release on core 0.4 until wave 4 of the cascade, so
+  `tests/secret_key.rs` keeps it on a test-only core 0.3 alias, in a kernel of
+  its own. The library links only core 0.4.
 
 ## 0.20.0 (unreleased)
 

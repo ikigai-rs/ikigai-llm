@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-llm"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 # The measured floor (ledger #181), and what the shared CI's msrv job now runs clippy + test
 # on. Measured 2026-10-13 on a FRESH resolve, which is what CI builds (Cargo.lock is not
@@ -28,9 +28,11 @@ categories = ["web-programming"]
 # so the move is breaking for consumers, hence llm 0.17.0. 0.3.0 is the scoped content
 # store (ledger #2965): held content is scoped to whoever delivered it, and
 # ContentStore::put/put_replay are root-only. This crate calls neither, but core's types
-# are still in its API, so the move is breaking again, hence llm 0.20.0. "0.3.0" admits
-# 0.3.x only.
-ikigai-core = "0.3.0"
+# are still in its API, so the move is breaking again, hence llm 0.20.0. 0.4.0 is core 0.4.0
+# (scope opacity, structured denials; the cascade, ledger #3893/#3929): core's types are in
+# this crate's API, so a consumer on core 0.3 cannot mix them, hence llm 0.21.0. "0.4.0"
+# admits 0.4.x only.
+ikigai-core = "0.4.0"
 # The HTTP I/O seam (HttpTransport) + wire types. The host injects one transport
 # (ureq/reqwest natively, fetch in the browser) and http + llm share it — no HTTP
 # client or executor baked into this crate. `net_allows_port` (since 0.1.7) is the
@@ -49,9 +51,10 @@ ikigai-core = "0.3.0"
 # public HttpTransport again, hence llm 0.18.0. 0.6.0 is the ikigai-http release on
 # ikigai-core 0.3.0 (ledger #2965): with core on 0.3, http must be too or the graph links
 # two cores. 0.7.0 requires cut authority for HTTP writes and makes `Method` non-exhaustive
-# (ledger #1880): `HttpTransport` is public here, so the next release is llm 0.21.0. A ceiling
-# too: "0.7.0" admits 0.7.x only.
-ikigai-http = "0.7.0"
+# (ledger #1880): `HttpTransport` is public here, so the next release is llm 0.21.0. 0.8.0 is
+# the ikigai-http release on core 0.4.0 (the cascade, ledger #3893/#3929): with core on 0.4,
+# http must be too or the graph links two cores. A ceiling too: "0.8.0" admits 0.8.x only.
+ikigai-http = "0.8.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -76,15 +79,23 @@ futures = "0.3"
 # ledger #2261), and turns DATATYPES and FAILURES on by default.
 # 0.12.0 adds BODIES and BODY-INPUTS by default; the suite shares the kernel
 # space so deterministic endpoints are actually probed (ledger #2576).
-# 0.14.0 is the release on ikigai-core 0.3.0 (ledger #2965), so the test build links one core.
-ikigai-conformance = "0.14.0"
+# 0.14.0 is the release on ikigai-core 0.3.0 (ledger #2965). 0.15.0 is the release on core
+# 0.4.0 (scope opacity, structured denials; the cascade, ledger #3893/#3929).
+ikigai-conformance = "0.15.0"
 # The real secrets space (`urn:secret:{name}`) over its file store in a scratch
 # directory, for `tests/secret_key.rs`: a provider's `api_key_secret` is read
 # from it by the test host's `SecretReader` (ledger #2691, #2706), and the space
 # proves a model caller cannot read the key there. Dev-only: the library takes
 # the host's reader and links no secrets crate. 0.4.0 is the release on ikigai-core
-# 0.3.0 (ledger #2965), so the test build links one core. "0.4.0" admits 0.4.x only.
+# 0.3.0 (ledger #2965). "0.4.0" admits 0.4.x only.
+#
+# ikigai-secret has no release on core 0.4 yet: it moves after engine, in wave 4 of the
+# core 0.4.0 cascade (ledger #3893). Until then it stays on core 0.3, and
+# `tests/secret_key.rs` mounts it in its own kernel on the TEST-ONLY alias below, beside the
+# llm space on core 0.4. When ikigai-secret ships on core 0.4, drop the alias and mount both
+# spaces in one kernel again. The library never links core 0.3.
 ikigai-secret = "0.4.0"
+ikigai-core-03 = { package = "ikigai-core", version = "0.3.0" }
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"

@@ -23,7 +23,7 @@ Existing code read for this spike:
 | A default-model 404 can cause a second completion attempt with a different model. | [src/lib.rs:909–937](../src/lib.rs#L909) |
 | Buffered JSON exposes usage or null; plain text exposes only completion text. Generation representations have no explicit cache validity. | [src/lib.rs:969–1000](../src/lib.rs#L969) |
 | The stream parser discards usage-only events and ends at `[DONE]`; dropping the body drops the reader. | [src/streaming.rs:23–24](../src/streaming.rs#L23), [src/streaming.rs:80–98](../src/streaming.rs#L80) |
-| The library injects its transport; its declared core dependency is 0.3.0. | [src/lib.rs:779–796](../src/lib.rs#L779), [Cargo.toml:33–54](../Cargo.toml#L33) |
+| The library injects its transport; its declared core dependency is 0.4.0. | [src/lib.rs:779–796](../src/lib.rs#L779), [Cargo.toml:33–54](../Cargo.toml#L33) |
 | Embedding has its own routed path, so an ask-only gate would not cover all inference. | [src/embed.rs:50–95](../src/embed.rs#L50) |
 
 Reproduction: `cargo test --test budget_baseline` exercises the public kernel

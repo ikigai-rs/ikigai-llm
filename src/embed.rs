@@ -192,11 +192,14 @@ impl EmbedBackend {
         requested_face(inv, &JSON_ONLY)?;
 
         if self.config.caps.cost.as_deref() != Some("local") && !self.config.embed_remote {
-            return Err(Error::Denied(format!(
-                "{who}: provider `{provider}` is not declared `cost: \"local\"`, and its \
+            return Err(Error::Denied(
+                format!(
+                    "{who}: provider `{provider}` is not declared `cost: \"local\"`, and its \
                  configuration does not set `embed_remote: true`; text is embedded by a \
                  local model only unless the configuration allows a remote one"
-            )));
+                )
+                .into(),
+            ));
         }
 
         let headers = provider_headers(inv, &self.config, true).await?;
