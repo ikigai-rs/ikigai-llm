@@ -1985,10 +1985,13 @@ fn select_reachable<'a>(
         return Ok(winner);
     }
     if select(registry, &needs, |_| true).is_some() {
-        return Err(Error::Denied(format!(
-            "{who}: no backend this capability may reach satisfies `{needs_text}` \
+        return Err(Error::Denied(
+            format!(
+                "{who}: no backend this capability may reach satisfies `{needs_text}` \
              (a urn:cap:net grant for the backend's host is the fix)"
-        )));
+            )
+            .into(),
+        ));
     }
     Err(no_match_error(who, needs_text, registry))
 }
@@ -2304,7 +2307,11 @@ fn with_context(error: Error, context: impl FnOnce(&str) -> String) -> Error {
         Error::Timeout(m) => Error::Timeout(context(&m)),
         Error::Unavailable(m) => Error::Unavailable(context(&m)),
         Error::Endpoint(m) => Error::Endpoint(context(&m)),
-        Error::Denied(m) => Error::Denied(context(&m)),
+        Error::Denied(d) => {
+            // Reworded with the scopes the caller lacked kept (core 0.4's structured denial).
+            let message = context(d.message());
+            Error::Denied(d.reworded(message))
+        }
         Error::Refused(m) => Error::Refused(context(&m)),
         Error::NotFound(m) => Error::NotFound(context(&m)),
         Error::Conflict(m) => Error::Conflict(context(&m)),
@@ -2906,9 +2913,9 @@ async fn secret_key(inv: &Invocation<'_>, config: &OpenAiConfig, name: &str) -> 
     };
     let scope = use_scope(&config.provider);
     if !inv.capability.allows(&scope) {
-        return Err(Error::Denied(context(&format!(
-            "using this provider requires `{scope}`"
-        ))));
+        return Err(Error::Denied(
+            context(&format!("using this provider requires `{scope}`")).into(),
+        ));
     }
     let Some(secrets) = &config.secrets else {
         return Err(Error::Endpoint(context(
@@ -2978,9 +2985,10 @@ fn scrub_userinfo(text: String, url: &str) -> String {
 /// whichever gate refused. It names the host (a grant is the fix), never the
 /// prompt.
 fn net_denied(who: &str, host: &str) -> Error {
-    Error::Denied(format!(
-        "{who}: capability does not allow reaching `{host}` (needs urn:cap:net:{host})"
-    ))
+    Error::Denied(
+        format!("{who}: capability does not allow reaching `{host}` (needs urn:cap:net:{host})")
+            .into(),
+    )
 }
 
 #[cfg(test)]
