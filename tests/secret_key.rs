@@ -6,27 +6,19 @@
 //! (ledger #2706).
 //!
 //! The secrets space is the real one (`ikigai_secret::space`) over its file store
-//! in a scratch directory, mounted in a kernel of its own so a test can try to
-//! read the key the way a caller would; the host's reader is [`HostSecrets`] over
-//! the same store; the provider is [`Stub`], an in-process
+//! in a scratch directory, mounted beside llm so a test can try to read the key
+//! the way a caller would; the host's reader is [`HostSecrets`] over the same
+//! store; the provider is [`Stub`], an in-process
 //! [`HttpTransport`] that answers like an OpenAI-shaped API (401 without the right
 //! Bearer token) and logs every request, so a test can prove what was sent.
-//!
-//! Core 0.4.0 cascade (ledger #3893): ikigai-secret has no release on core 0.4
-//! until wave 4, after engine, so its space is still a core 0.3 space and cannot
-//! sit in the same kernel as llm's core 0.4 one. Until then it is mounted in its
-//! own kernel on the TEST-ONLY `ikigai-core-03` alias ([`secrets_kernel`]), over
-//! the same store, and its errors cross to core 0.4 in [`HostSecrets`]. When
-//! ikigai-secret moves to core 0.4, mount both spaces in one kernel again.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ikigai_core_03 as core03;
-
 use ikigai_core::{
-    ArgRef, Capability, EndpointSpace, Error, Iri, Kernel, Representation, Request, Verb,
+    ArgRef, Capability, EndpointSpace, Error, Fallback, Iri, Kernel, Representation, Request,
+    Space, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use ikigai_llm::{space, space_with_secrets, use_scope, OpenAiConfig, Registry, SecretReader};
@@ -97,18 +89,8 @@ struct HostSecrets(Arc<FileBackend>);
 impl SecretReader for HostSecrets {
     fn read(&self, name: &str) -> ikigai_core::Result<Vec<u8>> {
         self.0
-            .get(name)
-            .map_err(from_core03)?
+            .get(name)?
             .ok_or_else(|| Error::NotFound(format!("no secret `{name}`")))
-    }
-}
-
-/// A core 0.3 error from ikigai-secret as a core 0.4 one, until ikigai-secret
-/// moves to core 0.4 (wave 4 of the cascade, ledger #3893).
-fn from_core03(e: core03::Error) -> Error {
-    match e {
-        core03::Error::NotFound(m) => Error::NotFound(m),
-        other => Error::Endpoint(other.to_string()),
     }
 }
 
@@ -142,7 +124,8 @@ const NAMED_DISCOVERING: &str = r#"{ "default": "remote", "providers": {
     "remote": { "base_url": "https://api.example.com/v1",
                 "api_key_secret": "remote-api-key" } } }"#;
 
-/// The llm space, reading keys through the host's reader over `store`.
+/// The llm space, reading keys through the host's reader, with the real secrets
+/// space beside it, in one kernel.
 fn kernel(stub: Arc<Stub>, store: &Store, json: &str) -> Kernel {
     let transport: Arc<dyn HttpTransport> = stub;
     let llm: EndpointSpace = space_with_secrets(
@@ -150,13 +133,9 @@ fn kernel(stub: Arc<Stub>, store: &Store, json: &str) -> Kernel {
         Arc::new(HostSecrets(store.backend())),
         Registry::from_json(json).unwrap(),
     );
-    Kernel::new(Arc::new(llm))
-}
-
-/// The real secrets space over the same `store`, in its own core 0.3 kernel
-/// until ikigai-secret moves to core 0.4 (wave 4 of the cascade, ledger #3893).
-fn secrets_kernel(store: &Store) -> core03::Kernel {
-    core03::Kernel::new(Arc::new(ikigai_secret::space(store.backend())))
+    let secrets = ikigai_secret::space(store.backend());
+    let spaces: Vec<Arc<dyn Space>> = vec![Arc::new(llm), Arc::new(secrets)];
+    Kernel::new(Arc::new(Fallback::new(spaces)))
 }
 
 fn ask(iri: &str) -> Request {
@@ -364,18 +343,17 @@ fn the_inventory_does_not_probe_a_keyed_provider_the_caller_cannot_use() {
 
 /// A keyed provider mounted with `space` (no reader) refuses, naming the
 /// provider and the secret: it never falls back to the caller's authority.
-/// (The secrets space is not mounted beside it until ikigai-secret moves to core
-/// 0.4, wave 4 of the cascade, ledger #3893; the refusal names the missing reader.)
 #[test]
 fn a_keyed_provider_without_a_reader_refuses_and_sends_nothing() {
     let store = Store::new("noreader");
     store.backend().set(SECRET, KEY.as_bytes()).unwrap();
     let stub = Stub::new();
     let transport: Arc<dyn HttpTransport> = stub.clone();
-    let k = Kernel::new(Arc::new(space(
-        transport,
-        Registry::from_json(NAMED).unwrap(),
-    )));
+    let spaces: Vec<Arc<dyn Space>> = vec![
+        Arc::new(space(transport, Registry::from_json(NAMED).unwrap())),
+        Arc::new(ikigai_secret::space(store.backend())),
+    ];
+    let k = Kernel::new(Arc::new(Fallback::new(spaces)));
     let caller = scoped(&[
         "urn:cap:net:api.example.com",
         "urn:cap:llm:use:remote",
@@ -556,7 +534,12 @@ fn a_provider_built_in_code_may_name_a_secret() {
     };
     let stub = Stub::new();
     let transport: Arc<dyn HttpTransport> = stub.clone();
-    let k = Kernel::new(Arc::new(space(transport, Registry::single(config))));
+    let llm = space(transport, Registry::single(config));
+    let spaces: Vec<Arc<dyn Space>> = vec![
+        Arc::new(llm),
+        Arc::new(ikigai_secret::space(store.backend())),
+    ];
+    let k = Kernel::new(Arc::new(Fallback::new(spaces)));
     let rep = run(&k, ask("urn:llm:remote:ask"), &granted()).unwrap();
     assert_eq!(text(&rep), "Hello there!");
 }
@@ -576,21 +559,8 @@ fn the_grants_a_model_caller_needs_cannot_read_the_key() {
     let rep = run(&k, ask("urn:llm:remote:ask"), &granted()).unwrap();
     assert_eq!(text(&rep), "Hello there!");
 
-    // The same grants, asked of the secrets space (its own core 0.3 kernel until
-    // wave 4 of the cascade, ledger #3893).
-    let secrets = secrets_kernel(&store);
-    let read = core03::Request::new(
-        core03::Verb::Source,
-        core03::Iri::parse("urn:secret:remote-api-key").unwrap(),
-    );
-    let caller = core03::Capability::scoped(
-        ["urn:cap:net:api.example.com", "urn:cap:llm:use:remote"].map(String::from),
-    );
-    match futures::executor::block_on(secrets.issue(read, &caller)) {
-        Ok(rep) => panic!(
-            "the caller read the raw key: {:?}",
-            String::from_utf8_lossy(&rep.bytes)
-        ),
-        Err(e) => assert!(matches!(e, core03::Error::Denied(_)), "{e:?}"),
+    match run(&k, get("urn:secret:remote-api-key"), &granted()) {
+        Ok(rep) => panic!("the caller read the raw key: {:?}", text(&rep)),
+        Err(e) => assert!(matches!(e, Error::Denied(_)), "{e:?}"),
     }
 }

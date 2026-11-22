@@ -539,10 +539,9 @@ against scratch servers on 127.0.0.1.
 - `ikigai-http` moves to 0.7.0 (#44), then to 0.8.0, its release on core 0.4. A
   host shares one transport between `ikigai-http`'s space and this one, so move
   both together.
-- Dev-dependencies: `ikigai-conformance` moves to 0.15.0, its release on core 0.4.
-  `ikigai-secret` has no release on core 0.4 until wave 4 of the cascade, so
-  `tests/secret_key.rs` keeps it on a test-only core 0.3 alias, in a kernel of
-  its own. The library links only core 0.4.
+- Dev-dependencies: `ikigai-conformance` moves to 0.15.0 and `ikigai-secret` to
+  0.5.0, their releases on core 0.4, so `tests/secret_key.rs` mounts the secrets
+  space beside llm in one kernel again. The library links only core 0.4.
 
 ## 0.20.0 (unreleased)
 

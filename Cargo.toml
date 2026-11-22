@@ -86,16 +86,11 @@ ikigai-conformance = "0.15.0"
 # directory, for `tests/secret_key.rs`: a provider's `api_key_secret` is read
 # from it by the test host's `SecretReader` (ledger #2691, #2706), and the space
 # proves a model caller cannot read the key there. Dev-only: the library takes
-# the host's reader and links no secrets crate. 0.4.0 is the release on ikigai-core
-# 0.3.0 (ledger #2965). "0.4.0" admits 0.4.x only.
-#
-# ikigai-secret has no release on core 0.4 yet: it moves after engine, in wave 4 of the
-# core 0.4.0 cascade (ledger #3893). Until then it stays on core 0.3, and
-# `tests/secret_key.rs` mounts it in its own kernel on the TEST-ONLY alias below, beside the
-# llm space on core 0.4. When ikigai-secret ships on core 0.4, drop the alias and mount both
-# spaces in one kernel again. The library never links core 0.3.
-ikigai-secret = "0.4.0"
-ikigai-core-03 = { package = "ikigai-core", version = "0.3.0" }
+# the host's reader and links no secrets crate. 0.5.0 is the release on ikigai-core
+# 0.4 (wave 4 of the core 0.4.0 cascade, ledger #3893, #3913), so the secrets space mounts
+# beside llm in one kernel again and the test-only core 0.3 alias is gone. "0.5.0" admits
+# 0.5.x only.
+ikigai-secret = "0.5.0"
 # A blocking HTTP client for the `ask` example's live smoke test (a real
 # HttpTransport against a running Ollama). Dev-only — never in the shipped crate.
 ureq = "2"
