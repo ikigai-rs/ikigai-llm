@@ -26,6 +26,9 @@ use ikigai_secret::{Backend, FileBackend};
 
 /// The secret's value: a shape every provider-issued key has.
 const KEY: &str = "sk-proj-Secr3tValue_0123456789";
+/// The Authorization header the key must produce, spelled out in full so the test stays an
+/// oracle independent of the code under test. It must stay `KEY` with the scheme in front.
+const BEARER: &str = "Bearer sk-proj-Secr3tValue_0123456789";
 const SECRET: &str = "remote-api-key";
 
 const CANNED: &str = r#"{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":"Hello there!"},"finish_reason":"stop"}]}"#;
@@ -65,7 +68,7 @@ fn authorization(r: &HttpRequest) -> Vec<String> {
 #[async_trait]
 impl HttpTransport for Stub {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, String> {
-        let authed = authorization(&request) == [format!("Bearer {KEY}")];
+        let authed = authorization(&request) == [BEARER];
         let out = if !authed {
             reply(
                 401,
@@ -179,7 +182,7 @@ fn a_provider_naming_a_secret_authenticates_with_it() {
     let sent = stub.sent();
     assert_eq!(sent.len(), 2);
     for r in &sent {
-        assert_eq!(authorization(r), [format!("Bearer {KEY}")], "{}", r.url);
+        assert_eq!(authorization(r), [BEARER], "{}", r.url);
     }
 }
 
@@ -224,7 +227,7 @@ fn the_probes_carry_the_secret_key() {
     );
     assert!(!stub.sent().is_empty());
     for r in stub.sent() {
-        assert_eq!(authorization(&r), [format!("Bearer {KEY}")], "{}", r.url);
+        assert_eq!(authorization(&r), [BEARER], "{}", r.url);
     }
 }
 
