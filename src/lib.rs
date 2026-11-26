@@ -953,7 +953,11 @@ impl OpenAiBackend {
                 format!(
                     "llm backend returned {}: {}",
                     response.status,
-                    error_detail(&response, &caller_text)
+                    error_detail(
+                        &response,
+                        &caller_text,
+                        &provider_credentials(&self.config, &headers)
+                    )
                 ),
             ));
         }
@@ -1018,10 +1022,15 @@ impl OpenAiBackend {
 ///   reason this module can type (ledger #178); the status code still says
 ///   what kind of failure it was.
 ///
-/// From a JSON body, `caller_text` (the prompt and system prompt) is then cut,
-/// in its raw and its JSON-escaped spelling, wherever a server echoed it. A
+/// From a JSON body, `credentials` (what [`provider_credentials`] lists: the
+/// provider's own key and URL password) are then cut as `[credential]`, and
+/// `caller_text` (the prompt and system prompt) as `[prompt]`, each in its raw and
+/// its JSON-escaped spelling, wherever a server echoed it: OpenAI's 401 reads
+/// "Incorrect API key provided: <key>", and a proxy may quote the whole
+/// `Authorization` value or the request URL (ledger #4020). Credentials go first,
+/// so a cut prompt cannot split a key into pieces no longer recognized. A
 /// description carries none of the server's text, so there is nothing to cut.
-fn error_detail(response: &Reply, caller_text: &[&str]) -> String {
+fn error_detail(response: &Reply, caller_text: &[&str], credentials: &[String]) -> String {
     if response.body_unread {
         return format!(
             "unread error body ({}, over {DEFAULT_MAX_RESPONSE_BYTES} bytes or unreadable)",
@@ -1040,16 +1049,55 @@ fn error_detail(response: &Reply, caller_text: &[&str]) -> String {
             )
         }
     };
+    let detail = credentials
+        .iter()
+        .fold(detail, |detail, secret| cut(detail, secret, "[credential]"));
     caller_text
         .iter()
-        .filter(|t| !t.is_empty())
-        .fold(detail, |detail, text| {
-            let escaped = serde_json::to_string(text).unwrap_or_default();
-            let escaped = escaped.trim_matches('"');
-            detail
-                .replace(*text, "[prompt]")
-                .replace(escaped, "[prompt]")
-        })
+        .fold(detail, |detail, text| cut(detail, text, "[prompt]"))
+}
+
+/// `detail` with `text`, in its raw and its JSON-escaped spelling, replaced by
+/// `mark`. Empty text cuts nothing.
+fn cut(detail: String, text: &str, mark: &str) -> String {
+    if text.is_empty() {
+        return detail;
+    }
+    let escaped = serde_json::to_string(text).unwrap_or_default();
+    let escaped = escaped.trim_matches('"');
+    let detail = detail.replace(text, mark);
+    if escaped.is_empty() {
+        detail
+    } else {
+        detail.replace(escaped, mark)
+    }
+}
+
+/// What a provider's error text must never carry: each `Authorization` value in
+/// `headers` (the ones [`provider_headers`] built, so a key read through
+/// `api_key_secret` is here too) whole and as its bare token, and the userinfo of
+/// `config`'s `base_url` whole and as its password. Longest first, so `Bearer
+/// <token>` is cut whole before the token inside it.
+fn provider_credentials(config: &OpenAiConfig, headers: &[(String, String)]) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            secrets.push(value.clone());
+            if let Some((_, token)) = ikigai_http::auth::scheme(value) {
+                secrets.push(token.to_string());
+            }
+        }
+    }
+    if let Some(info) = userinfo(&config.base_url) {
+        secrets.push(info.to_string());
+        if let Some((_, password)) = info.split_once(':') {
+            secrets.push(password.to_string());
+        }
+    }
+    secrets.retain(|s| !s.is_empty());
+    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets.dedup();
+    secrets
 }
 
 /// The `type/subtype` of a `Content-Type` header, parameters dropped and
@@ -4501,6 +4549,36 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&out.bytes).contains("sk-SECRET"),
             "the real key must never appear"
+        );
+    }
+
+    /// A credential a server wrote in its JSON-escaped spelling (a reason that
+    /// quotes a JSON document) is cut too, and so is a password echoed without
+    /// its user.
+    #[test]
+    fn error_detail_cuts_escaped_credentials_and_a_bare_password() {
+        let config = OpenAiConfig {
+            base_url: r#"http://u:p\w"d@localhost/v1"#.into(),
+            ..OpenAiConfig::ollama("m")
+        };
+        let headers = vec![("Authorization".to_string(), "Bearer tok-123".to_string())];
+        let secrets = provider_credentials(&config, &headers);
+        assert_eq!(
+            secrets,
+            ["Bearer tok-123", "tok-123", r#"u:p\w"d"#, r#"p\w"d"#]
+        );
+        let message = r#"sent {"url":"http://u:p\\w\"d@localhost"} and p\w"d, tok-123"#;
+        let reply = Reply {
+            status: 401,
+            headers: Vec::new(),
+            body: json!({ "error": { "message": message } })
+                .to_string()
+                .into_bytes(),
+            body_unread: false,
+        };
+        assert_eq!(
+            error_detail(&reply, &[], &secrets),
+            r#"sent {"url":"http://[credential]@localhost"} and [credential], [credential]"#
         );
     }
 }

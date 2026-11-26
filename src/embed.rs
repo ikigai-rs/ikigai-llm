@@ -221,7 +221,11 @@ impl EmbedBackend {
                 format!(
                     "{who}: embedding with `{model}` failed, the backend returned {}: {}",
                     response.status,
-                    error_detail(&response, &[text])
+                    error_detail(
+                        &response,
+                        &[text],
+                        &provider_credentials(&self.config, &headers)
+                    )
                 ),
             ));
         }

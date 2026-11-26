@@ -480,7 +480,8 @@ source urn:llm:embed model=embeddinggemma text=<text>
   model cuts that thread. A copy served before the cut still names the digest that
   made it.
 - **The text is data, never quoted.** It goes to the backend only: never into an
-  error (a server that echoes it has it cut to `[prompt]`) and never into a trace
+  error (a server that echoes it has it cut to `[prompt]`, and the provider's key
+  or URL password to `[credential]`) and never into a trace
   note (those carry the model, digest, provider and cost).
 
 Gated like every provider call (`urn:cap:net:<host>`, and the provider's
@@ -522,6 +523,18 @@ its words (`timed out`, `timeout`) with the URL removed; anything else
 unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
+
+## Unreleased
+
+- **A backend's error reason no longer carries the provider's credentials**
+  (ledger #4020). A JSON error body's reason reaches the caller's error, and a
+  provider may quote what it was sent there (OpenAI's 401 says "Incorrect API key
+  provided: <key>"; a proxy may quote the `Authorization` value or the request
+  URL). The error of `ask` and `embed` now replaces the key (as `Bearer <token>`
+  and on its own, whether inline or read through `api_key_secret`) and the
+  `base_url`'s `user:password` (and the password alone) with `[credential]`, in
+  raw and JSON-escaped spellings. Pinned by `tests/provider_credentials.rs`, which
+  failed on 0.21.0.
 
 ## 0.21.0 (unreleased)
 
