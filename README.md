@@ -524,7 +524,7 @@ unanswered is `Unavailable`. The message is this crate's, with any
 `user:password@` in the URL scrubbed. Pinned by `tests/transport_errors.rs`
 against scratch servers on 127.0.0.1.
 
-## Unreleased
+## 0.21.1
 
 - **A backend's error reason no longer carries the provider's credentials**
   (ledger #4020). A JSON error body's reason reaches the caller's error, and a
@@ -536,7 +536,7 @@ against scratch servers on 127.0.0.1.
   raw and JSON-escaped spellings. Pinned by `tests/provider_credentials.rs`, which
   failed on 0.21.0.
 
-## 0.21.0 (unreleased)
+## 0.21.0
 
 - **`urn:llm:embed` and `urn:llm:<provider>:embed`** (ledger #3690): text to a
   vector from a named model, over Ollama's `/api/embed`, answering the model's
