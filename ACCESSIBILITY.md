@@ -40,7 +40,8 @@ check, label or describe it: whatever the model writes (Markdown, code, emoji, a
 a wrong or harmful answer) reaches the caller as written. A host that shows it to a person owns
 how it is presented. Also not this repository's: the sentence each error kind is wrapped in
 (ikigai-core's `Display`), and the reason field of a backend's JSON error body, which is passed
-through with the caller's prompt cut out.
+through with the caller's prompt cut out (`[prompt]`) and the provider's own key and URL
+password cut out (`[credential]`).
 
 ## The rules that output follows
 
@@ -68,6 +69,7 @@ review and manual checks below are not automated by these tests.
 |---|---|---|
 | Declared output faces and refusal of unsupported faces | Pass | `tests/as_faces.rs`, run by the command above. Checks served media types, defaults and refusal text; does not evaluate how a host presents the output. |
 | Backend error bodies | Pass | `tests/error_bodies.rs`, run by the command above. Checks that HTML and plain-text error bodies are described rather than forwarded, and JSON reasons retained; does not establish that every reason is understandable. |
+| Provider credentials in error text | Pass | `tests/provider_credentials.rs` and the `error_detail_cuts_escaped_credentials_and_a_bare_password` unit test, run by `cargo test --all-targets` (rustc 1.100.0) on the branch that added them. Checks that a key or URL password a backend quotes in its error reason is replaced by the word `[credential]` for `ask` and `embed` while the rest of the reason still reads; does not evaluate how a host announces the error. |
 | Transport failure types | Pass | `tests/transport_errors.rs`, run by the command above against scratch servers. Checks failure classification and propagation; does not evaluate spoken error messages. |
 | Redirect refusals | Pass | `tests/redirects.rs`, run by the command above. Checks status, location, missing location and refusal to follow redirects; does not test a person's ability to act on the advice. |
 | Input refusals and sensitive text in errors | Pass | `tests/audit.rs`, run by the command above. Checks invalid typed inputs, capability boundaries, URL credential redaction and prompt removal from errors; not a general readability or security evaluation. |
